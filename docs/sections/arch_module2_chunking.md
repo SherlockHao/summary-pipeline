@@ -17,7 +17,10 @@
 
 ## 1. 共享数据结构定义
 
-以下类型贯穿三个模块，统一定义于 `core/types.py`。
+<!-- FIXED: BLOCK-1 — 统一引用 models/types.py 中的 Utterance 数据结构，与 Module 1 保持一致 -->
+<!-- FIXED: BLOCK-9 — 统一使用 MatchResult + MatchType 枚举 -->
+
+以下类型贯穿三个模块，统一定义于 `models/types.py`（而非 `core/types.py`），确保 Module 1 生产、Module 2 消费的 Utterance 完全一致。
 
 ```python
 from __future__ import annotations
@@ -27,37 +30,80 @@ from typing import Optional, Sequence
 
 # ── 基础枚举 ─────────────────────────────────────────
 
-class AlignmentQuality(Enum):
+class AlignmentQuality(str, Enum):
     HIGH = "high"
     MEDIUM = "medium"
     LOW = "low"
 
-class KeyPersonLevel(Enum):
-    P0 = "P0"
-    P1 = "P1"
-    P2 = "P2"
-    P3 = "P3"
+class MatchType(str, Enum):
+    EXACT = "exact"
+    ASR_CORRECTED = "asr_corrected"
+    FUZZY = "fuzzy"
+    INFERRED = "inferred"
+    NONE = "none"
+
+# ── 匹配结果 ─────────────────────────────────────────
+
+@dataclass(frozen=True)
+class MatchResult:
+    person_id: Optional[str]
+    person_name: Optional[str]
+    level: str                            # "P0" | "P1" | "P2" | "P3" | "UNKNOWN"
+    original_level: Optional[str]
+    match_type: MatchType
+    confidence: float
+
+# ── 特征结构 ─────────────────────────────────────────
+
+@dataclass
+class UtteranceFeatures:
+    duration_sec: float
+    start_time_of_day: str
+    time_period: str
+    position_in_session: float
+    speaker_id: str
+    turn_index: int
+    speaker_turn_count: int
+    speaker_duration_ratio: float
+    char_count: int
+    char_rate: float
+    sentence_count: int
+    keyword_density: float
+    contains_question: bool
+    contains_action_word: bool
+    scene_guess: Optional[str]
 
 # ── 输入层核心结构 ───────────────────────────────────
 
 @dataclass(frozen=True)
 class Utterance:
-    """预处理后的最小对话单元（合并后的话语段）。"""
+    """预处理后的最小对话单元（合并后的话语段）。
+    由 Module 1 生产，Module 2 消费。定义于 models/types.py，全局唯一。
+    """
     utterance_id: str                     # 全局唯一标识，如 "utt_20260327_093012_001"
     speaker_id: str                       # 说话人标识
     speaker_name: Optional[str]           # ASR / 配置推断的姓名
+    text: str                             # ASR 识别文本
     start_time: float                     # 起始时间戳（秒，相对录音起点）
     end_time: float                       # 结束时间戳（秒）
-    text: str                             # ASR 识别文本
-    asr_confidence: float                 # ASR 置信度 0.0-1.0
+    asr_confidence: float                 # ASR 置信度 0.0-1.0（合并时取 avg）
     speaker_confidence: float             # 说话人归属置信度 0.0-1.0
-    alignment_quality: AlignmentQuality   # 对齐质量
-    key_person_level: Optional[KeyPersonLevel]  # 关键人等级（None 表示非关键人）
+    alignment_quality: AlignmentQuality   # 对齐质量，Enum: HIGH/MEDIUM/LOW
     token_count: int                      # 预计算的 token 数
+    match_result: Optional[MatchResult]   # 关键人匹配结果（Module 1 Step 4 填充）
+    features: Optional[UtteranceFeatures] # 特征（Module 1 Step 3 填充）
+    segment_count: int                    # 合并的原始 segment 数量
 
     @property
     def duration(self) -> float:
         return self.end_time - self.start_time
+
+    @property
+    def key_person_level(self) -> Optional[str]:
+        """便捷属性：从 match_result 中提取关键人等级。"""
+        if self.match_result and self.match_result.match_type != MatchType.NONE:
+            return self.match_result.level
+        return None
 
 # ── 会话检测输出 ─────────────────────────────────────
 
@@ -389,6 +435,13 @@ flowchart TD
 > 文件：`core/chunking_engine.py`
 > 职责：将会话检测 + 碎片聚合后的处理单元，按照 L0→L1→L2→L3 四级分层策略切分为最终 Chunk，送入 LLM 摘要生成。
 
+<!-- FIXED: BLOCK-10 — 明确区分 80K（摘要模式切换阈值）与 200K（单 Chunk token 上限） -->
+
+> **重要阈值区分**：
+> - `short_day_threshold = 80,000 tokens`：由上游 `SummaryOrchestrator` 判断日类型（短日/长日）。当全天总 token < 80K 时走短日模式（全量单次输入 LLM），分片引擎**不被调用**。
+> - `chunk_token_budget = 200,000 tokens`：分片引擎内部参数，单个 Chunk 的最大 token 容量。仅在 long_day 模式（全天 >= 80K）或 degraded 模式下，分片引擎才被调用，此时每个 Chunk 上限为 200K。
+> - 分片引擎仅在 **long_day / degraded** 模式下被调用，短日模式下整条流水线跳过分片直接进入摘要生成。
+
 ### 4.1 插件化架构设计
 
 分片引擎采用 **策略模式（Strategy Pattern）** + **责任链（Chain of Responsibility）** 混合架构。每一层策略实现统一的抽象接口，引擎按优先级顺序逐层应用。
@@ -496,7 +549,11 @@ class ChunkingEngine:
             processing_units=processing_units,
         )
 
-        # 短日判断：无需分片
+        <!-- FIXED: BLOCK-10 — 此处 token_budget=200K 是单 Chunk 容量上限，非短日阈值（80K）。
+             短日/长日模式切换由上游 SummaryOrchestrator 判断（80K 阈值），
+             分片引擎仅在 long_day/degraded 模式下被调用。
+             若全天 token 恰好 < 200K（但 >= 80K），仍打包为单个 Chunk。 -->
+        # 全天总 token 低于单 Chunk 容量：打包为单个 Chunk
         if total_tokens <= self.token_budget:
             return self._build_single_chunk(sessions, context)
 
@@ -564,7 +621,7 @@ class ProtectionZone:
     """关键人保护区。"""
     zone_id: str
     key_person_ids: list[str]             # 涉及的关键人
-    key_person_level: KeyPersonLevel      # 最高等级
+    key_person_level: str                 # 最高等级，如 "P0"（来自 Utterance.key_person_level）
     start_time: float
     end_time: float
     utterances: list[Utterance]
@@ -633,7 +690,7 @@ class L1KeyPersonStrategy(ChunkingStrategy):
 
         for session in sessions:
             for utt in session.utterances:
-                is_kp = utt.key_person_level in (KeyPersonLevel.P0, KeyPersonLevel.P1)
+                is_kp = utt.key_person_level in ("P0", "P1")
                 if is_kp:
                     if utt.start_time - last_kp_time > self.KEY_PERSON_GAP_THRESHOLD and current_zone_utts:
                         zones.append(self._build_zone(current_zone_utts))
@@ -653,13 +710,57 @@ class L1KeyPersonStrategy(ChunkingStrategy):
 
         return zones
 
+    <!-- FIXED: _subdivide_zone 补充伪代码 -->
     def _subdivide_zone(self, zone: ProtectionZone, context: ChunkingContext) -> list[BoundaryCandidate]:
         """超长保护区（>60min）内部再细分。
 
         策略：优先使用 L2 主题边界；若无合适主题边界则退化为时间窗口等分。
         切分后每段标注关联性标签，如 "战略研讨会-第2部分，共4部分"。
         """
-        ...
+        # Step 1: 尝试用 L2 主题边界策略在保护区内部寻找自然切分点
+        l2 = L2TopicBoundaryStrategy()
+        # 构造仅含保护区 utterance 的虚拟处理单元
+        virtual_session = Session(
+            session_id=f"{zone.zone_id}_virtual",
+            utterances=zone.utterances,
+            start_time=zone.start_time,
+            end_time=zone.end_time,
+            total_tokens=zone.total_tokens,
+            speaker_set={u.speaker_id for u in zone.utterances},
+            has_key_person=True,
+            gap_before=None,
+        )
+        inner_candidates = l2.find_boundaries(
+            [virtual_session],
+            context,
+        )
+
+        # Step 2: 筛选——仅保留能将保护区切为 <= MAX_ZONE_DURATION 段的边界
+        target_parts = math.ceil(zone.duration / self.MAX_ZONE_DURATION)
+        if len(inner_candidates) >= target_parts - 1:
+            # 按分数降序取前 target_parts - 1 个，再按时间排序
+            selected = sorted(inner_candidates, key=lambda b: -b.score)[:target_parts - 1]
+            selected.sort(key=lambda b: b.position_time)
+        else:
+            # Step 3: L2 边界不足，退化为等时间窗口切分
+            window = zone.duration / target_parts
+            selected = []
+            for k in range(1, target_parts):
+                t = zone.start_time + window * k
+                selected.append(BoundaryCandidate(
+                    position_time=t,
+                    score=0.5,           # 中等分数，低于 L1 但高于 L3
+                    source=f"{self.name}_subdivide",
+                    utterance_index=self._nearest_utterance_in_zone(t, zone),
+                    is_session_boundary=False,
+                ))
+
+        # Step 4: 为每段标注关联性标签
+        total_parts = len(selected) + 1
+        for idx, boundary in enumerate(selected):
+            boundary.label = f"第{idx + 1}部分，共{total_parts}部分"
+
+        return selected
 
     def validate_chunk(self, chunk, context) -> bool:
         # 校验：P0/P1 关键人的连续对话不被割裂（除非超长再细分）
@@ -701,7 +802,8 @@ def _resolve_conflict(
 |:---|:---|:---|:---|
 | 说话人切换 | **0.35** | 滑动窗口（5min）内说话人集合 Jaccard 距离 > 0.5 | 前后各取 5min 窗口比较 |
 | 静默间隔 | **0.35** | 当前 gap 超过局部均值 2 倍标准差 | 局部窗口 = 前后 10min 内的所有 gap |
-| 语义辅助 | **0.30** | 相邻文本窗口 embedding 余弦相似度低于阈值 | text2vec-base-chinese，窗口 500 字 |
+<!-- FIXED: 说明 embedding 模型选型和缓存策略 -->
+| 语义辅助 | **0.30** | 相邻文本窗口 embedding 余弦相似度低于阈值 | **text2vec-base-chinese**（shibing624/text2vec-base-chinese），窗口 500 字。Embedding 在 Module 1 预处理阶段按 500 字滑动窗口预计算并缓存（以 utterance_id + 窗口偏移为 key 存入内存 dict），分片引擎直接查表，避免重复推理。 |
 
 **融合公式**：
 
@@ -815,6 +917,8 @@ class L2TopicBoundaryStrategy(ChunkingStrategy):
         if not text_before or not text_after:
             return 0.0
 
+        # _get_embedding 从预计算缓存中查表（key = 文本哈希），
+        # 缓存在 Module 1 预处理阶段由 EmbeddingPrecomputer 填充。
         sim = self._cosine_similarity(
             self._get_embedding(text_before),
             self._get_embedding(text_after),
@@ -832,6 +936,12 @@ class L2TopicBoundaryStrategy(ChunkingStrategy):
 
 当 L1、L2 未产生足够切分点时，L3 作为保底按固定窗口切分。
 
+<!-- FIXED: L3 时间窗口说明——30-60min 为正常保底策略，120min 为极端场景上限 -->
+
+> **L3 时间窗口范围说明**：
+> - **30-60 分钟**（`MIN_WINDOW` ~ `MAX_WINDOW`）：常规保底策略的自适应范围。`_adaptive_window` 根据 token 密度在此区间内动态选择窗口大小——密集对话缩短至 30min，稀疏对话拉长至 60min。
+> - **120 分钟**：PRD 中提及的极端场景上限（如全天仅 1 个超长独白 Session，且 L1/L2 均无有效边界）。此时 L3 的 `MAX_WINDOW` 可由 `ChunkingConfig` 覆盖为 120min，作为最终兜底。默认配置下不启用 120min 窗口。
+
 ```python
 class L3TimeWindowStrategy(ChunkingStrategy):
     name = "L3_time_window"
@@ -839,7 +949,7 @@ class L3TimeWindowStrategy(ChunkingStrategy):
 
     DEFAULT_WINDOW = 2700.0                # 默认窗口 45 分钟
     MIN_WINDOW = 1800.0                    # 最小 30 分钟
-    MAX_WINDOW = 3600.0                    # 最大 60 分钟
+    MAX_WINDOW = 3600.0                    # 最大 60 分钟（极端场景可由配置覆盖为 7200.0 即 120 分钟）
 
     def find_boundaries(self, units, context) -> list[BoundaryCandidate]:
         total_duration = context.sessions[-1].end_time - context.sessions[0].start_time
@@ -996,7 +1106,7 @@ def _attach_tail_context(self, chunks: list[Chunk]) -> None:
         # 提取摘要要素
         speakers = list({u.speaker_name or u.speaker_id for u in tail_utts})
         key_persons = [u.speaker_name or u.speaker_id for u in tail_utts
-                       if u.key_person_level in (KeyPersonLevel.P0, KeyPersonLevel.P1)]
+                                      if u.key_person_level in ("P0", "P1")]
         last_text = " ".join(u.text for u in tail_utts[-3:])  # 最后 3 句原文
         time_range = f"{self._format_time(tail_utts[0].start_time)}-{self._format_time(tail_utts[-1].end_time)}"
 
@@ -1007,7 +1117,8 @@ def _attach_tail_context(self, chunks: list[Chunk]) -> None:
             f"末尾话题: {last_text[:200]}"
         )
 
-        chunk.tail_context_summary = summary[:400]  # 硬截断 400 字
+        <!-- FIXED: 尾部上下文摘要截断改为 300 字，与 PRD 200-300 字要求对齐 -->
+        chunk.tail_context_summary = summary[:300]  # 硬截断 300 字
 ```
 
 **完整阶段增强方案**（MVP 后）：尾部上下文摘要可替换为轻量级 LLM 调用（`max_tokens=200`），生成更精炼的语义摘要而非规则拼接。
@@ -1016,9 +1127,9 @@ def _attach_tail_context(self, chunks: list[Chunk]) -> None:
 
 ```mermaid
 flowchart TD
-    A[输入: Session 列表 + 聚合后处理单元] --> B{total_tokens <= budget?}
-    B -- 是 --> C[短日模式: 全量打包为单个 Chunk]
-    B -- 否 --> D[长日模式: 启动策略链]
+    A[输入: Session 列表 + 聚合后处理单元<br>仅 long_day/degraded 模式调用] --> B{total_tokens <= chunk_token_budget 200K?}
+    B -- 是 --> C[单 Chunk 模式: 全量打包为单个 Chunk]
+    B -- 否 --> D[多 Chunk 模式: 启动策略链]
 
     D --> E[L0: 收集 Session 边界<br>硬约束]
     E --> F[L1: 检测关键人保护区<br>优先约束]
@@ -1050,7 +1161,7 @@ flowchart TD
 | | `pack_duration_limit` | 900s（15min） | 聚合包时长上限 |
 | | `proximity_threshold` | 600s（10min） | 时间邻近性阈值 |
 | | `min_aggregation_count` | 2 | 最少聚合 Session 数 |
-| **分片引擎** | `token_budget` | 200,000 | 单 Chunk token 上限 |
+| **分片引擎** | `token_budget` | 200,000 | 单 Chunk token 上限（`chunk_token_budget`）。注意：短日模式阈值 80K 由 SummaryOrchestrator 管理，分片引擎不涉及 |
 | | `soft_boundary_range` | (60s, 90s) | 软边界搜索范围 |
 | **L1 关键人保护** | `KEY_PERSON_GAP_THRESHOLD` | 120s（2min） | 关键人对话间隔容忍 |
 | | `MAX_ZONE_DURATION` | 3600s（60min） | 保护区上限 |
@@ -1067,7 +1178,7 @@ flowchart TD
 | | `MIN_BOUNDARY_INTERVAL` | 120s | 相邻边界最小间隔 |
 | **L3 时间窗口** | `DEFAULT_WINDOW` | 2700s（45min） | 默认切分窗口 |
 | | `MIN_WINDOW` | 1800s（30min） | 最小窗口 |
-| | `MAX_WINDOW` | 3600s（60min） | 最大窗口 |
+| | `MAX_WINDOW` | 3600s（60min） | 最大窗口（极端场景可配置覆盖为 7200s/120min） |
 
 ---
 

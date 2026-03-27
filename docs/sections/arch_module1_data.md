@@ -259,18 +259,18 @@ deviation = abs(declared_duration - actual_span) / declared_duration
 
 ### 2.0 预处理流水线总览
 
+<!-- FIXED: BLOCK-5 — 会话检测去重：移除原 Step 1（会话检测），会话检测统一由 Module 2 的 SessionDetector 执行。预处理流水线从五步改为四步。 -->
+
 ```mermaid
 flowchart TD
-    A[SessionRaw 输入] --> B[Step 1: 对话会话检测]
-    B --> C["List[ConversationSession]"]
-    C --> D[Step 2: 置信度分级过滤]
-    D --> E[Step 3: 话语合并]
-    E --> F[Step 4: 特征计算]
-    F --> G[Step 5: 关键人元数据关联]
-    G --> H["List[ProcessedSession] 输出"]
+    A[SessionRaw 输入] --> B[Step 1: 置信度分级过滤]
+    B --> C[Step 2: 话语合并]
+    C --> D[Step 3: 特征计算]
+    D --> E[Step 4: 关键人元数据关联]
+    E --> F["list[Utterance] 扁平输出"]
 ```
 
-预处理层的输入为校验通过的 `SessionRaw`，输出为富含特征标注的 `ProcessedSession` 列表。
+预处理层的输入为校验通过的 `SessionRaw`，输出为扁平的 `list[Utterance]`（引用 `models/types.py` 中的统一 Utterance）。会话检测不在此处执行，统一由下游 Module 2 的 `SessionDetector` 负责。
 
 ```python
 class Preprocessor:
@@ -278,91 +278,27 @@ class Preprocessor:
         self.config = config
         self.key_people = key_people
 
-    def process(self, session: SessionRaw) -> list[ProcessedSession]:
-        # Step 1: 会话检测 — 切分为多个 ConversationSession
-        conversations = self._detect_conversations(session)
-        results = []
-        for conv in conversations:
-            # Step 2: 置信度过滤（需要关键人信息做分级）
-            cleaned = self._filter_by_confidence(conv)
-            # Step 3: 话语合并
-            utterances = self._merge_utterances(cleaned)
-            # Step 4: 特征计算
-            enriched = self._compute_features(utterances, conv)
-            # Step 5: 关键人元数据关联
-            linked = self._link_key_people(enriched)
-            results.append(ProcessedSession(
-                session_id=conv.session_id,
-                time_range=(conv.start_time, conv.end_time),
-                utterances=linked,
-            ))
-        return results
+    def process(self, session: SessionRaw) -> list[Utterance]:
+        # Step 1: 置信度过滤（需要关键人信息做分级）
+        cleaned = self._filter_by_confidence(session.segments)
+        # Step 2: 话语合并
+        utterances = self._merge_utterances(cleaned)
+        # Step 3: 特征计算
+        enriched = self._compute_features(utterances, session)
+        # Step 4: 关键人元数据关联
+        linked = self._link_key_people(enriched)
+        return linked
 ```
 
-### 2.1 Step 1：对话会话检测
+<!-- FIXED: BLOCK-5 — 原 Step 1（对话会话检测）已移除，会话检测统一由 Module 2 的 SessionDetector 执行。 -->
+
+### 2.1 Step 1：置信度分级过滤
 
 #### 2.1.1 目标
 
-将一段长时间连续录音（如 8-12 小时）按自然对话边界切分为独立的 `ConversationSession`，作为后续所有处理的基本单位。
-
-#### 2.1.2 算法：双条件门控
-
-```
-输入: segments: List[Segment]（已按 start_ms 排序）
-输出: conversations: List[ConversationSession]
-
-当前会话 current = [segments[0]]
-for i in range(1, len(segments)):
-    gap_ms = segments[i].start_ms - segments[i-1].end_ms
-    speaker_changed = segments[i].speaker_id != segments[i-1].speaker_id
-
-    if gap_ms >= SILENCE_THRESHOLD_MS and speaker_changed:
-        # 双条件同时满足 → 会话边界
-        conversations.append(build_conversation(current))
-        current = [segments[i]]
-    else:
-        current.append(segments[i])
-
-conversations.append(build_conversation(current))  # 最后一个会话
-```
-
-**双条件门控的设计理由**：仅靠静默时长会将"一个人长时间思考后继续发言"误判为会话边界；仅靠说话人变化无法区分同一会议内的正常轮流发言。两个条件同时满足才切分。
-
-#### 2.1.3 关键参数
-
-| 参数 | 默认值 | 可配置 | 说明 |
-|:---|:---|:---|:---|
-| `SILENCE_THRESHOLD_MS` | 180,000 (3min) | 是 | 静默时长阈值 |
-| `MIN_CONVERSATION_SEGMENTS` | 2 | 是 | 少于此数的会话合并到相邻会话 |
-
-#### 2.1.4 输出数据结构
-
-```python
-@dataclass
-class ConversationSession:
-    session_id: str               # 自动生成，格式 "{device_id}_{序号:03d}"
-    start_time: datetime          # 会话起始绝对时间
-    end_time: datetime            # 会话结束绝对时间
-    segments: list[Segment]       # 属于本会话的片段集合
-    gap_before_ms: Optional[int]  # 与前一个会话的间隔（首个会话为 None）
-```
-
-#### 2.1.5 异常处理
-
-| 场景 | 处理 |
-|:---|:---|
-| 全部片段构成单一会话（无边界） | 正常返回，仅包含一个 `ConversationSession` |
-| 检测到极短会话（<2 个片段） | 合并至时间最近的相邻会话，记录 WARNING |
-
----
-
-### 2.2 Step 2：置信度分级过滤
-
-#### 2.2.1 目标
-
 根据说话人的关键人等级，分级过滤低置信度片段。关键人的发言采用更宽松的阈值，避免丢失嘈杂环境下的关键指令。
 
-#### 2.2.2 算法
+#### 2.1.2 算法
 
 ```
 输入: segments: List[Segment], key_people: KeyPeopleConfig
@@ -390,9 +326,9 @@ for seg in segments:
                                           threshold=threshold, level=level))
 ```
 
-**注意**：此步骤需要提前执行一次粗粒度的说话人-关键人匹配（仅 L1 精确匹配），以获得说话人等级。完整的四级匹配在 Step 5 执行。若 L1 匹配不到，视为 `UNKNOWN`，使用最严格阈值 0.60。
+**注意**：此步骤需要提前执行一次粗粒度的说话人-关键人匹配（仅 L1 精确匹配），以获得说话人等级。完整的四级匹配在 Step 4 执行。若 L1 匹配不到，视为 `UNKNOWN`，使用最严格阈值 0.60。
 
-#### 2.2.3 关键参数
+#### 2.1.3 关键参数
 
 | 参数 | 默认值 | 说明 |
 |:---|:---|:---|
@@ -402,26 +338,30 @@ for seg in segments:
 | `DEFAULT_ASR_THRESHOLD` | 0.60 | P3 及未知说话人 ASR 置信度阈值 |
 | `COLD_START_THRESHOLD_OVERRIDE` | 0.25 | 冷启动期（Day 1-5）全局覆盖阈值 |
 
-#### 2.2.4 异常处理
+#### 2.1.4 异常处理
 
 | 场景 | 处理 |
 |:---|:---|
-| 过滤后某会话片段为空 | 整个 `ConversationSession` 标记为 `LOW_QUALITY`，跳过后续步骤 |
+| 过滤后片段列表为空 | 返回空的 `list[Utterance]`，记录 WARNING |
 | 过滤比例 >80% | 记录 WARNING，可能表明录音环境极差或设备故障 |
 
 ---
 
-### 2.3 Step 3：话语合并
+### 2.2 Step 2：话语合并
 
-#### 2.3.1 目标
+#### 2.2.1 目标
 
 将同一说话人的连续短碎片聚合为语义连贯的 `Utterance`，减少碎片化，同时通过时长上限保证下游分片的灵活性。
 
-#### 2.3.2 算法
+#### 2.2.2 算法
 
+<!-- FIXED: 话语合并增加空列表检查 -->
 ```
 输入: segments: List[Segment]（已过滤）
 输出: utterances: List[Utterance]
+
+if not segments:
+    return []      # 空列表直接返回，不进入合并逻辑
 
 current_group = [segments[0]]
 
@@ -447,58 +387,73 @@ for i in range(1, len(segments)):
 utterances.append(build_utterance(current_group))  # 最后一组
 ```
 
+<!-- FIXED: BLOCK-1 — build_utterance 输出统一 Utterance（引用 models/types.py） -->
 **`build_utterance` 合并逻辑**：
 
 ```python
-def build_utterance(group: list[Segment]) -> Utterance:
+from models.types import Utterance, AlignmentQuality
+import tiktoken
+
+_encoder = tiktoken.encoding_for_model("gpt-4")  # 或项目统一的 tokenizer
+
+def build_utterance(group: list[Segment], seq_id: int) -> Utterance:
+    merged_text = " ".join(seg.text for seg in group)
     return Utterance(
-        start_ms=group[0].start_ms,
-        end_ms=group[-1].end_ms,
+        utterance_id=f"utt_{group[0].start_ms}_{seq_id:04d}",
         speaker_id=group[0].speaker_id,
-        text=" ".join(seg.text for seg in group),  # 合并文本，空格连接
-        avg_asr_confidence=mean(seg.asr_confidence for seg in group),
-        min_asr_confidence=min(seg.asr_confidence for seg in group),
-        avg_speaker_confidence=mean(seg.speaker_confidence for seg in group),
-        worst_alignment=min(seg.alignment_quality for seg in group, key=quality_rank),
+        speaker_name=group[0].speaker_name,          # 取首条 Segment 的姓名
+        text=merged_text,
+        start_time=group[0].start_ms / 1000.0,       # 毫秒 → 秒
+        end_time=group[-1].end_ms / 1000.0,           # 毫秒 → 秒
+        asr_confidence=mean(seg.asr_confidence for seg in group),  # 取 avg
+        speaker_confidence=mean(seg.speaker_confidence for seg in group),
+        alignment_quality=min(
+            (seg.alignment_quality for seg in group), key=quality_rank
+        ),
+        token_count=len(_encoder.encode(merged_text)),
+        match_result=None,              # Step 4 关键人关联后填充
+        features=None,                  # Step 3 特征计算后填充
         segment_count=len(group),
-        has_overlap=any(seg.is_overlap for seg in group),
     )
 ```
 
-#### 2.3.3 Utterance 数据结构
+#### 2.2.3 Utterance 数据结构（统一定义）
+
+<!-- FIXED: BLOCK-1 — 统一 Utterance 数据结构，定义于 models/types.py，Module 1 生产，Module 2 消费 -->
 
 ```python
-@dataclass
+# 定义于 models/types.py，全局唯一
+@dataclass(frozen=True)
 class Utterance:
-    start_ms: int
-    end_ms: int
-    speaker_id: str
-    text: str
-    # ---- 聚合置信度 ----
-    avg_asr_confidence: float
-    min_asr_confidence: float
-    avg_speaker_confidence: float
-    worst_alignment: AlignmentQuality
-    # ---- 合并元信息 ----
-    segment_count: int          # 合并前的原始 Segment 数量
-    has_overlap: bool           # 是否包含重叠标记的 Segment
-    # ---- 以下字段在 Step 4/5 中填充 ----
-    features: Optional[UtteranceFeatures] = None
-    key_person_match: Optional[KeyPersonMatch] = None
+    utterance_id: str           # 唯一标识
+    speaker_id: str             # 说话人ID
+    speaker_name: Optional[str] # 说话人姓名（可能为空）
+    text: str                   # 合并后的文本
+    start_time: float           # 开始时间（秒）
+    end_time: float             # 结束时间（秒）
+    asr_confidence: float       # ASR 置信度（取 avg）
+    speaker_confidence: float   # 说话人归属置信度
+    alignment_quality: AlignmentQuality
+    token_count: int            # token 数量
+    match_result: Optional[MatchResult]  # 关键人匹配结果
+    features: Optional[UtteranceFeatures]  # 特征（Module 1 计算）
+    segment_count: int          # 合并的原始 segment 数量
 
     @property
-    def duration_ms(self) -> int:
-        return self.end_ms - self.start_ms
+    def duration(self) -> float:
+        return self.end_time - self.start_time
 ```
 
-#### 2.3.4 关键参数
+> **注意**：`frozen=True` 保证 Utterance 不可变。Step 3（特征计算）和 Step 4（关键人关联）通过 `dataclasses.replace()` 返回新实例来填充 `features` 和 `match_result` 字段。
+
+#### 2.2.4 关键参数
 
 | 参数 | 默认值 | 说明 |
 |:---|:---|:---|
 | `MERGE_GAP_THRESHOLD_MS` | 4,000 (4s) | 同一说话人片段间隔 <=此值则合并（PRD 范围 3-5s，取中值） |
 | `MERGE_MAX_DURATION_MS` | 120,000 (120s) | 单个 Utterance 时长上限，超过强制拆分 |
 
-#### 2.3.5 异常处理
+#### 2.2.5 异常处理
 
 | 场景 | 处理 |
 |:---|:---|
@@ -507,13 +462,13 @@ class Utterance:
 
 ---
 
-### 2.4 Step 4：特征计算
+### 2.3 Step 3：特征计算
 
-#### 2.4.1 目标
+#### 2.3.1 目标
 
 为每个 `Utterance` 附加结构化特征，供下游智能分层和重要性评估使用。
 
-#### 2.4.2 特征字段定义
+#### 2.3.2 特征字段定义
 
 ```python
 @dataclass
@@ -542,96 +497,129 @@ class UtteranceFeatures:
     scene_guess: Optional[str]       # 场景推测："meeting" | "call" | "dictation" | None
 ```
 
-#### 2.4.3 计算逻辑伪代码
+#### 2.3.3 计算逻辑伪代码
 
 ```python
 def _compute_features(
     self,
     utterances: list[Utterance],
-    conv: ConversationSession,
+    session: SessionRaw,
 ) -> list[Utterance]:
 
-    # 预计算会话级统计
-    total_duration = conv.end_time - conv.start_time
-    speaker_durations: dict[str, int] = defaultdict(int)
+    # 预计算全局统计（注意：此时尚无会话边界，统计基于全部 utterance）
+    total_duration_sec = session.total_duration_ms / 1000.0
+    speaker_durations: dict[str, float] = defaultdict(float)
     speaker_turn_counters: dict[str, int] = defaultdict(int)
 
     for utt in utterances:
-        speaker_durations[utt.speaker_id] += utt.duration_ms
+        speaker_durations[utt.speaker_id] += utt.duration  # duration 单位为秒
 
+    result = []
     for idx, utt in enumerate(utterances):
         speaker_turn_counters[utt.speaker_id] += 1
 
-        utt.features = UtteranceFeatures(
-            duration_sec=utt.duration_ms / 1000.0,
-            start_time_of_day=format_time(conv.start_time, utt.start_ms),
-            time_period=classify_time_period(conv.start_time, utt.start_ms),
-            position_in_session=utt.start_ms / max(1, conv_duration_ms),
+        features = UtteranceFeatures(
+            duration_sec=utt.duration,
+            start_time_of_day=format_time(session.session_start, utt.start_time),
+            time_period=classify_time_period(session.session_start, utt.start_time),
+            position_in_session=utt.start_time / max(0.1, total_duration_sec),
             speaker_id=utt.speaker_id,
             turn_index=idx + 1,
             speaker_turn_count=speaker_turn_counters[utt.speaker_id],
             speaker_duration_ratio=(
-                speaker_durations[utt.speaker_id] / max(1, sum(speaker_durations.values()))
+                speaker_durations[utt.speaker_id] / max(0.1, sum(speaker_durations.values()))
             ),
             char_count=len(utt.text),
-            char_rate=len(utt.text) / max(0.1, utt.duration_ms / 1000.0),
+            char_rate=len(utt.text) / max(0.1, utt.duration),
             sentence_count=count_sentences(utt.text),
             keyword_density=compute_keyword_density(utt.text, KEYWORD_LIST),
             contains_question="？" in utt.text or "吗" in utt.text,
             contains_action_word=any(w in utt.text for w in ACTION_WORDS),
             scene_guess=guess_scene(utt.text),
         )
-    return utterances
+        # frozen=True，通过 replace 返回新实例
+        result.append(dataclasses.replace(utt, features=features))
+    return result
 ```
 
-#### 2.4.4 关键参数与辅助常量
+#### 2.3.4 关键参数与辅助常量
+
+<!-- FIXED: 去掉对未定义的 config/keywords.yaml 的引用，KEYWORD_LIST 直接硬编码在代码中 -->
 
 | 参数 | 默认值 | 说明 |
 |:---|:---|:---|
-| `KEYWORD_LIST` | 配置文件加载 | 业务关键词列表（"预算""决策""风险""合同"等） |
+| `KEYWORD_LIST` | 硬编码列表 | 业务关键词列表：`["预算", "决策", "风险", "合同", "KPI", "营收", "利润", "战略", "竞品", "融资", "股东", "董事会"]`。后续版本可迁移至配置中心统一管理。 |
 | `ACTION_WORDS` | `["决定", "安排", "要求", "通知", "确认", "同意", "否决", "推迟"]` | 行动词集合 |
 | `TIME_PERIOD_BOUNDARIES` | `{"morning": (6,12), "afternoon": (12,18), "evening": (18,24)}` | 时段划分边界（小时） |
 
-#### 2.4.5 `classify_time_period` 逻辑
+#### 2.3.5 `classify_time_period` 逻辑
 
 ```
-hour = (session_start + offset_ms).hour
+hour = (session_start + timedelta(seconds=offset_sec)).hour
 if 6 <= hour < 12:  return "morning"
 if 12 <= hour < 18: return "afternoon"
 return "evening"
 ```
 
+<!-- FIXED: 补充 guess_scene 函数的判断规则 -->
+#### 2.3.6 `guess_scene` 场景推测规则
+
+```python
+SCENE_RULES: list[tuple[str, list[str], int]] = [
+    # (场景标签, 关键词列表, 最低命中数)
+    ("meeting",    ["会议", "议题", "纪要", "参会", "讨论", "决议", "表决"], 2),
+    ("call",       ["电话", "打给", "接听", "通话", "挂断", "拨打"], 1),
+    ("dictation",  ["记录一下", "备忘", "口述", "帮我记", "语音备忘"], 1),
+]
+
+def guess_scene(text: str) -> Optional[str]:
+    """基于关键词命中规则推测 utterance 所属场景。
+
+    规则：按 SCENE_RULES 顺序匹配，首个满足最低命中数的场景胜出。
+    若无命中则返回 None。
+    """
+    for scene, keywords, min_hits in SCENE_RULES:
+        hits = sum(1 for kw in keywords if kw in text)
+        if hits >= min_hits:
+            return scene
+    return None
+```
+
 ---
 
-### 2.5 Step 5：关键人元数据关联
+### 2.4 Step 4：关键人元数据关联
 
-#### 2.5.1 目标
+#### 2.4.1 目标
 
 将每个 Utterance 的 `speaker_id` 关联到关键人配置，输出匹配结果与匹配层级。
 
-#### 2.5.2 处理顺序：L1 → L1.5 → L2 → L3 逐层递进
+#### 2.4.2 处理顺序：L1 → L1.5 → L2 → L3 逐层递进
 
+<!-- FIXED: BLOCK-9 — 统一使用 MatchResult + MatchType 枚举，L2 使用 fuzzy（替代 alias），未匹配使用 none -->
 ```mermaid
 flowchart TD
     S[Utterance.speaker_id] --> L1{L1: Speaker ID 精确匹配}
-    L1 -- 命中 --> R1[match_type=exact, level=配置等级]
+    L1 -- 命中 --> R1[match_type=EXACT, level=配置等级]
     L1 -- 未命中 --> L15{L1.5: ASR 人名纠错匹配}
-    L15 -- 命中 --> R15[match_type=asr_corrected, level=配置等级]
+    L15 -- 命中 --> R15[match_type=ASR_CORRECTED, level=配置等级]
     L15 -- 未命中 --> L2{L2: 姓名/别名模糊匹配}
-    L2 -- 命中 --> R2[match_type=alias, level=配置等级]
+    L2 -- 命中 --> R2[match_type=FUZZY, level=配置等级]
     L2 -- 未命中 --> L3{L3: 内容推断匹配}
-    L3 -- 命中 --> R3["match_type=inferred, level=降一级"]
-    L3 -- 未命中 --> RN[match_type=none, level=UNKNOWN]
+    L3 -- 命中 --> R3["match_type=INFERRED, level=降一级"]
+    L3 -- 未命中 --> RN[match_type=NONE, level=UNKNOWN]
 ```
 
-#### 2.5.3 各层匹配逻辑
+#### 2.4.3 各层匹配逻辑
+
+<!-- FIXED: BLOCK-9 — 所有匹配逻辑统一返回 MatchResult，使用 MatchType 枚举 -->
 
 **L1 — Speaker ID 精确匹配**：
 ```
 for person in key_people:
     if utterance.speaker_id in person.speaker_ids:
-        return KeyPersonMatch(person_id=person.id, level=person.level,
-                              match_type="exact", confidence=0.98)
+        return MatchResult(person_id=person.id, person_name=person.name,
+                           level=person.level, original_level=person.level,
+                           match_type=MatchType.EXACT, confidence=0.98)
 ```
 
 **L1.5 — ASR 人名纠错匹配**：
@@ -642,8 +630,9 @@ for name in extracted_names:
         if name in correction.variants:
             person = find_person_by_name(correction.target)
             if person:
-                return KeyPersonMatch(person_id=person.id, level=person.level,
-                                      match_type="asr_corrected", confidence=0.92)
+                return MatchResult(person_id=person.id, person_name=person.name,
+                                   level=person.level, original_level=person.level,
+                                   match_type=MatchType.ASR_CORRECTED, confidence=0.92)
 ```
 
 **L2 — 姓名/别名模糊匹配**：
@@ -653,8 +642,9 @@ candidate_name = utterance.speaker_name or extract_self_introduction(utterance.t
 if candidate_name:
     for person in key_people:
         if fuzzy_match(candidate_name, person.name, person.aliases, threshold=0.8):
-            return KeyPersonMatch(person_id=person.id, level=person.level,
-                                  match_type="alias", confidence=0.87)
+            return MatchResult(person_id=person.id, person_name=person.name,
+                               level=person.level, original_level=person.level,
+                               match_type=MatchType.FUZZY, confidence=0.87)
 ```
 
 **L3 — 内容推断匹配**：
@@ -663,67 +653,78 @@ if candidate_name:
 inferred_person = infer_speaker_from_context(utterance.text, key_people)
 if inferred_person:
     effective_level = downgrade_level(inferred_person.level)  # P0→P1, P1→P2, P2→P3
-    return KeyPersonMatch(person_id=inferred_person.id, level=effective_level,
-                          match_type="inferred", confidence=0.75)
+    return MatchResult(person_id=inferred_person.id, person_name=inferred_person.name,
+                       level=effective_level, original_level=inferred_person.level,
+                       match_type=MatchType.INFERRED, confidence=0.75)
 ```
 
-#### 2.5.4 匹配结果数据结构
+#### 2.4.4 匹配结果数据结构（统一定义）
+
+<!-- FIXED: BLOCK-9 — 统一 MatchResult，定义于 models/types.py -->
 
 ```python
-@dataclass
-class KeyPersonMatch:
+# 定义于 models/types.py，全局唯一
+
+class MatchType(str, Enum):
+    EXACT = "exact"
+    ASR_CORRECTED = "asr_corrected"
+    FUZZY = "fuzzy"           # 统一，替代原 "alias"
+    INFERRED = "inferred"
+    NONE = "none"             # 统一，替代原 "unknown"
+
+@dataclass(frozen=True)
+class MatchResult:
     person_id: Optional[str]     # 关键人 ID，未匹配时为 None
     person_name: Optional[str]   # 关键人姓名
     level: str                   # 有效等级："P0" | "P1" | "P2" | "P3" | "UNKNOWN"
-    original_level: Optional[str]  # 原始等级（仅 inferred 时与 level 不同）
-    match_type: str              # "exact" | "asr_corrected" | "alias" | "inferred" | "none"
+    original_level: Optional[str]  # 原始等级（仅 INFERRED 时与 level 不同）
+    match_type: MatchType        # 使用 MatchType 枚举
     confidence: float            # 匹配置信度
 ```
 
-#### 2.5.5 异常处理
+#### 2.4.5 异常处理
 
 | 场景 | 处理 |
 |:---|:---|
 | 同一 speaker_id 在不同 Utterance 匹配到不同关键人 | 取置信度最高的匹配结果全局统一，记录 WARNING |
 | L3 推断匹配到多个候选人 | 取置信度最高者，若差距 <0.1 则标记 `ambiguous`，不做匹配 |
-| 关键人配置为空 | 所有 Utterance 的 `key_person_match.match_type` 均为 `none`，正常继续 |
+| 关键人配置为空 | 所有 Utterance 的 `match_result.match_type` 均为 `MatchType.NONE`，正常继续 |
 
 ---
 
-### 2.6 预处理层最终输出
+### 2.5 预处理层最终输出
+
+<!-- FIXED: BLOCK-5 — 输出改为扁平 list[Utterance]，不再包装 ProcessedSession -->
+
+预处理层的最终输出为 **扁平的 `list[Utterance]`**，每个 Utterance 已包含 `features` 和 `match_result` 字段。会话切分由下游 Module 2 的 `SessionDetector` 负责。
 
 ```python
-@dataclass
-class ProcessedSession:
-    session_id: str                          # 会话标识
-    time_range: tuple[datetime, datetime]    # 起止时间
-    utterances: list[Utterance]              # 已关联特征与关键人信息的 Utterance 列表
-    metadata: SessionMetadata                # 会话级聚合元信息
+# 预处理层输出签名
+def process(self, session: SessionRaw) -> list[Utterance]:
+    ...
 
-@dataclass
-class SessionMetadata:
-    total_duration_sec: float
-    utterance_count: int
-    speaker_ids: list[str]
-    key_person_ids: list[str]           # 本会话中匹配到的关键人 ID 列表
-    dominant_speaker_id: Optional[str]  # 发言时长最长的说话人
-    scene_guess: Optional[str]          # 会话级场景推测（取 Utterance 中出现频率最高的场景）
-    filtered_segment_count: int         # Step 2 中被过滤掉的片段数
-    avg_asr_confidence: float           # 会话整体平均 ASR 置信度
+# 输出示例（伪）：
+# [
+#     Utterance(utterance_id="utt_0_0001", speaker_id="spk_001", ...,
+#               features=UtteranceFeatures(...), match_result=MatchResult(...)),
+#     Utterance(utterance_id="utt_3200_0002", speaker_id="spk_002", ...,
+#               features=UtteranceFeatures(...), match_result=MatchResult(...)),
+#     ...
+# ]
 ```
+
+> **元信息说明**：原 `SessionMetadata`（如 `dominant_speaker_id`、`scene_guess`、`avg_asr_confidence`）不再由 Module 1 计算。这些统计信息在 Module 2 完成会话检测后按 Session 粒度计算。
 
 ---
 
-### 2.7 配置汇总（PreprocessorConfig）
+### 2.6 配置汇总（PreprocessorConfig）
+
+<!-- FIXED: BLOCK-5 — 移除 Step 1 会话检测配置；FIXED: 去掉 config/keywords.yaml 引用 -->
 
 ```python
 @dataclass
 class PreprocessorConfig:
-    # Step 1: 会话检测
-    silence_threshold_ms: int = 180_000       # 3 分钟
-    min_conversation_segments: int = 2
-
-    # Step 2: 置信度过滤
+    # Step 1: 置信度过滤
     p0_asr_threshold: float = 0.35
     p1_asr_threshold: float = 0.40
     p2_asr_threshold: float = 0.50
@@ -731,12 +732,11 @@ class PreprocessorConfig:
     cold_start_threshold: float = 0.25
     is_cold_start: bool = False               # 冷启动模式开关
 
-    # Step 3: 话语合并
+    # Step 2: 话语合并
     merge_gap_threshold_ms: int = 4_000       # 4 秒
     merge_max_duration_ms: int = 120_000      # 120 秒
 
-    # Step 4: 特征计算
-    keyword_list_path: str = "config/keywords.yaml"
+    # Step 3: 特征计算
     time_period_boundaries: dict[str, tuple[int, int]] = field(
         default_factory=lambda: {
             "morning": (6, 12),
@@ -745,7 +745,7 @@ class PreprocessorConfig:
         }
     )
 
-    # Step 5: 关键人匹配
+    # Step 4: 关键人匹配
     asr_corrections_path: str = "config/asr_name_corrections.yaml"
     fuzzy_match_threshold: float = 0.80       # L2 模糊匹配相似度阈值
     inferred_match_min_confidence: float = 0.70  # L3 推断匹配最低置信度

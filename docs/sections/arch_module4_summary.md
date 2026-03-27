@@ -3,6 +3,17 @@
 > 对应源码：`core/summarizer.py`、`models/summary.py`、`prompts/`
 > 依据 PRD §5 多级摘要生成流程
 
+<!-- FIXED: BLOCK-6 — 统一导入声明 -->
+> **关键类型导入**（全模块统一）：
+> ```python
+> from models.types import ChatMessage, ChatCompletionResponse
+> from core.model_client import ModelClient          # async 协议
+> from core.token_budget import TokenBudgetController # 动态 token 预算
+> from core.batch_client import BatchClient           # Batch API 客户端
+> from core.retry_handler import RetryHandler         # 已内置于 ModelClient
+> from exceptions import QwenExhaustedError
+> ```
+
 ---
 
 ## 7.1 SummaryOrchestrator -- 核心调度器
@@ -21,11 +32,21 @@
 class SummaryOrchestrator:
     """摘要生成核心调度器。"""
 
-    def __init__(self, model_client: ModelClient, config: SummaryConfig):
-        self.model_client = model_client
+    # <!-- FIXED: BLOCK-7 — 注入 TokenBudgetController 依赖 -->
+    def __init__(
+        self,
+        model_client: ModelClient,
+        config: SummaryConfig,
+        token_budget_ctrl: TokenBudgetController,
+        use_batch: bool = False,           # <!-- FIXED: 补充 Batch API 集成参数 -->
+    ):
+        self.model_client = model_client   # ModelClient 内部已包含 RetryHandler，摘要模块无需显式调用 <!-- FIXED: 明确 RetryHandler 集成方式 -->
         self.config = config
-        self.short_day_handler = ShortDayHandler(model_client, config)
-        self.long_day_handler = LongDayHandler(model_client, config)
+        self.token_budget_ctrl = token_budget_ctrl
+        self.use_batch = use_batch
+        self.batch_client: BatchClient | None = BatchClient(model_client) if use_batch else None
+        self.short_day_handler = ShortDayHandler(model_client, config, token_budget_ctrl)
+        self.long_day_handler = LongDayHandler(model_client, config, token_budget_ctrl)
         self.degraded_handler = DegradedHandler(model_client, config)
 
     def select_mode(
@@ -60,14 +81,64 @@ class SummaryOrchestrator:
         total_tokens = preprocessed.total_token_count
         mode = self.select_mode(total_tokens, model_config.context_limit)
 
-        handler_map = {
-            "short_day": self.short_day_handler,
-            "long_day": self.long_day_handler,
-            "degraded": self.degraded_handler,
-        }
-        handler = handler_map[mode]
-        report = await handler.run(preprocessed, scoring_result, model_config)
-        report.metadata.generation_mode = mode
+        # <!-- FIXED: 补充 Batch API 集成方案 -->
+        if self.use_batch and self.batch_client is not None:
+            return await self.batch_client.submit(
+                mode=mode,
+                preprocessed=preprocessed,
+                scoring_result=scoring_result,
+                model_config=model_config,
+            )
+
+        # <!-- FIXED: BLOCK-11 — 补充 QwenExhaustedError 处理 -->
+        partial_results: list[SessionSummary] = []
+        try:
+            if mode == "short_day":
+                result = await self.short_day_handler.run(
+                    preprocessed, scoring_result, model_config
+                )
+            elif mode == "long_day":
+                result = await self.long_day_handler.run(
+                    preprocessed, scoring_result, model_config,
+                    partial_results=partial_results,   # 收集已完成的时段结果
+                )
+            else:
+                result = await self.degraded_handler.run(
+                    preprocessed, scoring_result, model_config
+                )
+        except QwenExhaustedError as e:
+            # 所有模型（主模型 + 降级模型）均已耗尽，推入人工队列
+            logger.error(f"QwenExhaustedError in mode={mode}: {e}")
+            return self._build_partial_report(partial_results, error=e)
+
+        result.metadata.generation_mode = mode
+        return result
+
+    def _build_partial_report(
+        self,
+        partial_results: list[SessionSummary],
+        error: QwenExhaustedError,
+    ) -> DailyReport:
+        """
+        构建部分结果报告：将已完成的时段摘要合并为不完整日报，
+        标记错误信息，并推入人工审核队列。
+        """
+        report = DailyReport(
+            executive_summary="[自动生成中断] 部分时段摘要已完成，请人工补充。",
+            key_meetings=[],
+            action_items=[],
+        )
+        # 归集已完成时段的内容
+        for session in partial_results:
+            for topic in session.topics:
+                report.key_meetings.append(
+                    KeyMeeting.from_session_topic(session, topic)
+                )
+                report.action_items.extend(topic.action_items)
+        report.metadata.generation_mode = "partial_failure"
+        report.metadata.error_message = str(error)
+        # 推入人工审核队列
+        HumanReviewQueue.enqueue(report, reason="QwenExhaustedError")
         return report
 ```
 
@@ -187,14 +258,16 @@ flowchart TD
 class ShortDayHandler:
     """短日模式：单次调用直出全天日报。"""
 
-    TOKEN_BUDGET = {
-        "system_prompt": 2000,
-        "key_people": 500,
-        "conversation": 75000,
-        "instructions": 300,
-        "output_reserved": 32768,
-        "safety_margin": 20000,
-    }
+    # <!-- FIXED: BLOCK-7 — 去掉硬编码 TOKEN_BUDGET，改为通过 TokenBudgetController 动态分配 -->
+    def __init__(
+        self,
+        model_client: ModelClient,
+        config: SummaryConfig,
+        token_budget_ctrl: TokenBudgetController,
+    ):
+        self.model_client = model_client
+        self.config = config
+        self.token_budget_ctrl = token_budget_ctrl
 
     async def run(
         self,
@@ -202,8 +275,17 @@ class ShortDayHandler:
         scoring: ScoringResult,
         model_config: ModelConfig,
     ) -> DailyReport:
+        # 动态获取 token 预算分配
+        budget = self.token_budget_ctrl.allocate(
+            total_tokens=preprocessed.total_token_count,
+            mode="short_day",
+        )
+        # budget 返回: {"system_prompt": ..., "key_people": ..., "conversation": ...,
+        #               "instructions": ..., "output_reserved": ..., "safety_margin": ...}
+
+        # <!-- FIXED: BLOCK-6 — 使用 await + list[ChatMessage] 参数类型 -->
         messages = self._build_messages(preprocessed, scoring)
-        response = await self.model_client.chat_completion(
+        response: ChatCompletionResponse = await self.model_client.chat_completion(
             model=model_config.model_name,
             messages=messages,
             enable_thinking=True,
@@ -211,16 +293,18 @@ class ShortDayHandler:
         )
         return self._parse_response(response)
 
+    # <!-- FIXED: BLOCK-6 — 返回类型改为 list[ChatMessage]，不再用 dict -->
     def _build_messages(
         self,
         preprocessed: PreprocessedData,
         scoring: ScoringResult,
-    ) -> list[dict]:
+    ) -> list[ChatMessage]:
+        """构建 ChatMessage 列表。从 models/types.py 导入 ChatMessage。"""
         system_content = self._load_system_prompt("short_day_system.txt")
         user_content = self._assemble_user_content(preprocessed, scoring)
         return [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": user_content},
+            ChatMessage(role="system", content=system_content),
+            ChatMessage(role="user", content=user_content),
         ]
 
     def _assemble_user_content(
@@ -233,6 +317,11 @@ class ShortDayHandler:
           1. 关键人列表区段
           2. 全量对话文本区段
           3. 生成指令区段
+
+        <!-- FIXED: 明确 scoring 在短日模式的使用方式 -->
+        注意：短日模式下 scoring 不注入 prompt，仅用于后处理阶段：
+        - key_meetings 按 FinalScore 降序排序
+        - 不影响 prompt 内容构建
         """
         parts = [
             self._format_key_people_section(preprocessed.key_people),
@@ -242,6 +331,17 @@ class ShortDayHandler:
             self._load_instruction_prompt("short_day_instructions.txt"),
         ]
         return "\n".join(parts)
+```
+
+    # <!-- FIXED: 明确 scoring 在短日模式的后处理使用方式 -->
+    def _parse_response(self, response: ChatCompletionResponse) -> DailyReport:
+        """解析响应并按 FinalScore 排序 key_meetings。"""
+        report = self.parser.parse_daily_report(response)
+        # 后处理：key_meetings 按评分的 FinalScore 降序排序
+        report.key_meetings.sort(
+            key=lambda m: self._get_max_score(m), reverse=True
+        )
+        return report
 ```
 
 **拼接区段详解**
@@ -255,12 +355,13 @@ class ShortDayHandler:
 
 ### 7.2.3 思考模式调用参数
 
+<!-- FIXED: BLOCK-6 — messages 在代码中为 list[ChatMessage]，此处展示序列化后的 API 请求体 -->
 ```python
-# 调用参数
+# API 请求体（ChatMessage 序列化后的等效 JSON）
 {
     "model": "qwen3-max",
     "enable_thinking": True,
-    "thinking_budget": 16384,       # 16K tokens 推理空间
+    "thinking_budget": 16384,       # 16K tokens 推理空间（PRD 统一为 16,384） <!-- FIXED: thinking_budget 统一为 16,384 -->
     "messages": [
         {"role": "system", "content": "<系统提示词>"},
         {"role": "user",   "content": "<关键人列表>\n---\n<全量对话文本>\n---\n<生成指令>"},
@@ -306,19 +407,36 @@ class ResponseParser:
 
     MAX_RETRIES = 2
 
-    def parse_daily_report(self, raw_response: str) -> DailyReport:
+    # <!-- FIXED: BLOCK-6 — 入参改为 ChatCompletionResponse 对象，从 .content 提取 JSON -->
+    def parse_daily_report(self, response: ChatCompletionResponse) -> DailyReport:
         """
         解析流程：
-          1. 提取 JSON（处理 markdown 代码块包裹等情况）
-          2. 结构校验（必填字段检查）
-          3. 业务校验（交叉一致性）
-          4. 构建 DailyReport 对象
+          1. 从 ChatCompletionResponse.content 提取原始文本
+          2. 提取 JSON（处理 markdown 代码块包裹等情况）
+          3. 结构校验（必填字段检查）
+          4. 业务校验（交叉一致性）
+          5. 构建 DailyReport 对象
         """
-        json_str = self._extract_json(raw_response)
+        raw_text = response.content      # 从响应对象提取文本
+        json_str = self._extract_json(raw_text)
         data = json.loads(json_str)
         self._validate_structure(data)
         self._validate_business_rules(data)
         return DailyReport.from_dict(data)
+
+    def parse_session_summary(self, response: ChatCompletionResponse) -> SessionSummary:
+        """解析时段摘要响应。"""
+        raw_text = response.content
+        json_str = self._extract_json(raw_text)
+        data = json.loads(json_str)
+        return SessionSummary.from_dict(data)
+
+    def parse_chunk_summary(self, response: ChatCompletionResponse) -> ChunkSummary:
+        """解析片段摘要响应。"""
+        raw_text = response.content
+        json_str = self._extract_json(raw_text)
+        data = json.loads(json_str)
+        return ChunkSummary.from_dict(data)
 
     def _extract_json(self, raw: str) -> str:
         """处理 LLM 输出可能的包裹格式（```json ... ```）。"""
@@ -475,27 +593,67 @@ class SessionSplitter:
 class LongDayHandler:
     """长日模式：两级弹性摘要。"""
 
+    def __init__(
+        self,
+        model_client: ModelClient,
+        config: SummaryConfig,
+        token_budget_ctrl: TokenBudgetController,
+    ):
+        self.model_client = model_client
+        self.config = config
+        self.token_budget_ctrl = token_budget_ctrl
+        self.splitter = SessionSplitter()
+        self.parser = ResponseParser()
+        self.deduplicator = Deduplicator()
+
     async def run(
         self,
         preprocessed: PreprocessedData,
         scoring: ScoringResult,
         model_config: ModelConfig,
+        partial_results: list[SessionSummary] | None = None,
     ) -> DailyReport:
         # 第一步：分片
         sessions = self.splitter.split(preprocessed)
 
-        # 第二步：并行生成时段摘要
-        session_summaries = await asyncio.gather(
-            *[
-                self._generate_session_summary(session, scoring, model_config)
-                for session in sessions
-            ]
+        # <!-- FIXED: BLOCK-7 — 通过 TokenBudgetController 获取动态预算 -->
+        budget = self.token_budget_ctrl.allocate(
+            total_tokens=preprocessed.total_token_count,
+            mode="long_day",
         )
+
+        # <!-- FIXED: BLOCK-11 — 单个时段摘要失败时跳过该时段并标记，不中断整个流程 -->
+        # 第二步：逐时段生成摘要，单个失败不中断
+        session_summaries: list[SessionSummary] = []
+        skipped_sessions: list[dict] = []
+        for session in sessions:
+            try:
+                summary = await self._generate_session_summary(
+                    session, scoring, model_config
+                )
+                session_summaries.append(summary)
+                if partial_results is not None:
+                    partial_results.append(summary)  # 供外层异常处理收集
+            except QwenExhaustedError as e:
+                logger.warning(
+                    f"时段 {session.session_id} 摘要生成失败，跳过: {e}"
+                )
+                skipped_sessions.append({
+                    "session_id": session.session_id,
+                    "error": str(e),
+                })
+                continue
+
+        if not session_summaries:
+            raise QwenExhaustedError("所有时段摘要均失败")
 
         # 第三步：合并生成全天日报
         report = await self._merge_to_daily_report(
             session_summaries, scoring, model_config
         )
+        # 标记跳过的时段
+        if skipped_sessions:
+            report.metadata.skipped_sessions = skipped_sessions
         return report
 
     async def _generate_session_summary(
@@ -504,8 +662,10 @@ class LongDayHandler:
         scoring: ScoringResult,
         model_config: ModelConfig,
     ) -> SessionSummary:
-        messages = self._build_session_messages(session, scoring)
-        response = await self.model_client.chat_completion(
+        # <!-- FIXED: BLOCK-6 — messages 使用 list[ChatMessage] -->
+        messages: list[ChatMessage] = self._build_session_messages(session, scoring)
+        # <!-- FIXED: BLOCK-6 — await async chat_completion，返回 ChatCompletionResponse -->
+        response: ChatCompletionResponse = await self.model_client.chat_completion(
             model=model_config.model_name,
             messages=messages,
             enable_thinking=True,
@@ -596,11 +756,13 @@ class LongDayHandler:
         all_critical_facts = self._collect_critical_facts(session_summaries)
 
         # 构建合并 prompt
-        messages = self._build_merge_messages(
+        # <!-- FIXED: BLOCK-6 — messages 使用 list[ChatMessage] -->
+        messages: list[ChatMessage] = self._build_merge_messages(
             session_summaries, topic_map, all_critical_facts
         )
 
-        response = await self.model_client.chat_completion(
+        # <!-- FIXED: BLOCK-6 — await async chat_completion，返回 ChatCompletionResponse -->
+        response: ChatCompletionResponse = await self.model_client.chat_completion(
             model=model_config.model_name,
             messages=messages,
             enable_thinking=True,
@@ -614,6 +776,9 @@ class LongDayHandler:
 
         return report
 ```
+
+<!-- FIXED: 明确长日模式中 scoring 的消费方式 -->
+> **长日模式 scoring 使用方式**：scoring 结果用于时段内内容排序（高分片段优先出现在 prompt 中）和 key_meetings 优先级排定（按 FinalScore 降序）。不用于内容裁剪。
 
 #### topic_id 跨时段关联实现
 
@@ -816,8 +981,9 @@ class DegradedHandler:
         model_config: ModelConfig,
     ) -> ChunkSummary:
         """片段级摘要。不启用思考模式（小模型不支持或效果不佳）。"""
-        messages = self._build_chunk_messages(chunk)
-        response = await self.model_client.chat_completion(
+        # <!-- FIXED: BLOCK-6 — messages 使用 list[ChatMessage]，response 为 ChatCompletionResponse -->
+        messages: list[ChatMessage] = self._build_chunk_messages(chunk)
+        response: ChatCompletionResponse = await self.model_client.chat_completion(
             model=model_config.model_name,
             messages=messages,
             enable_thinking=False,
@@ -830,8 +996,8 @@ class DegradedHandler:
         model_config: ModelConfig,
     ) -> SessionSummary:
         """将同一时段的片段摘要合并为时段摘要（同 5.2.2 格式）。"""
-        messages = self._build_session_merge_messages(chunk_summaries)
-        response = await self.model_client.chat_completion(
+        messages: list[ChatMessage] = self._build_session_merge_messages(chunk_summaries)
+        response: ChatCompletionResponse = await self.model_client.chat_completion(
             model=model_config.model_name,
             messages=messages,
             enable_thinking=False,
@@ -844,8 +1010,8 @@ class DegradedHandler:
         model_config: ModelConfig,
     ) -> DailyReport:
         """将各时段摘要合并为全天日报（同 5.4 格式）。"""
-        messages = self._build_daily_merge_messages(session_summaries)
-        response = await self.model_client.chat_completion(
+        messages: list[ChatMessage] = self._build_daily_merge_messages(session_summaries)
+        response: ChatCompletionResponse = await self.model_client.chat_completion(
             model=model_config.model_name,
             messages=messages,
             enable_thinking=False,
@@ -1099,12 +1265,14 @@ class CriticalFact:
 @dataclass
 class ReportMetadata:
     """日报元数据。"""
-    generation_mode: str = ""               # "short_day" / "long_day" / "degraded"
+    generation_mode: str = ""               # "short_day" / "long_day" / "degraded" / "partial_failure"
     report_date: str = ""                   # "2026-03-27"
     total_tokens_processed: int = 0
     api_calls_count: int = 0
     generation_time_seconds: float = 0.0
     model_name: str = ""
+    error_message: str | None = None        # <!-- FIXED: BLOCK-11 — 记录 QwenExhaustedError 信息 -->
+    skipped_sessions: list[dict] | None = None  # <!-- FIXED: BLOCK-11 — 记录跳过的时段 -->
 ```
 
 ### 7.5.3 三级阅读体验生成方法
@@ -1383,6 +1551,9 @@ class PromptTemplate:
 | 分片 | 无 | 2-3 个时段 | 多片段 -> 时段 -> 全天 |
 | 去重 | 模型内部完成 | 语义相似度 + 实体校验 | 同长日模式 |
 | topic_id | 模型单次内部分配 | 时段分配 + 跨时段关联 | 片段分配 + 逐级传递 |
+| scoring 使用 | 不注入 prompt，仅后处理排序 <!-- FIXED: 明确 scoring 使用 --> | 时段内容排序 + key_meetings 优先级 | 同长日模式 |
+| Token 预算 | `TokenBudgetController.allocate(mode="short_day")` <!-- FIXED: BLOCK-7 --> | `TokenBudgetController.allocate(mode="long_day")` | 固定值（降级模型 context 有限） |
+| 错误处理 | 捕获 QwenExhaustedError → 人工队列 <!-- FIXED: BLOCK-11 --> | 单时段失败跳过并标记 | 捕获 QwenExhaustedError → 人工队列 |
 | 输出格式 | DailyReport | DailyReport | DailyReport |
 
 ## 附录 B：关键配置参数汇总
@@ -1399,3 +1570,56 @@ class PromptTemplate:
 | `entity_overlap_threshold` | 0.80 | `Deduplicator` | 实体重合率阈值 |
 | `chunk_token_limit` | 8,000 | `DegradedHandler` | 降级模式单片段上限 |
 | `max_parse_retries` | 2 | `ResponseParser` | JSON 解析重试次数 |
+| `use_batch` | `false` | `SummaryOrchestrator` | 是否通过 Batch API 提交 <!-- FIXED: 补充 Batch API 参数 --> |
+
+---
+
+<!-- FIXED: 补充 Batch API 集成方案 -->
+## 附录 C：Batch API 集成方案
+
+`SummaryOrchestrator` 构造函数新增 `use_batch: bool` 参数（默认 `False`）。当 `use_batch=True` 时：
+
+1. 不走实时 `chat_completion` 路径，改为通过 `BatchClient.submit()` 提交异步批量任务
+2. `BatchClient` 封装 Qwen Batch API，将 messages 序列化为 JSONL 并提交
+3. 返回值为 `DailyReport`（异步轮询获取结果后解析）
+4. 适用于非实时场景（如夜间批量生成历史日报）
+
+```python
+class BatchClient:
+    """Batch API 客户端，封装异步批量提交。"""
+
+    def __init__(self, model_client: ModelClient):
+        self.model_client = model_client
+
+    async def submit(
+        self,
+        mode: str,
+        preprocessed: PreprocessedData,
+        scoring_result: ScoringResult,
+        model_config: ModelConfig,
+    ) -> DailyReport:
+        """提交批量任务并异步等待结果。"""
+        # 1. 根据 mode 构建完整 messages
+        # 2. 序列化为 JSONL 格式
+        # 3. 调用 Batch API 提交
+        # 4. 轮询等待完成
+        # 5. 解析结果并返回 DailyReport
+        ...
+```
+
+---
+
+<!-- FIXED: 明确 RetryHandler 集成方式 -->
+## 附录 D：RetryHandler 集成说明
+
+`ModelClient` 内部已集成 `RetryHandler`，摘要模块 **无需显式调用** 重试逻辑。具体行为：
+
+| 层级 | 重试职责 | 说明 |
+|:---|:---|:---|
+| `ModelClient` | 网络级重试 | 连接超时、429 限流、500 服务端错误，按指数退避重试 |
+| `ModelClient` | 模型降级 | 主模型失败后自动切换降级模型（如 qwen3-max -> qwen3-plus） |
+| `ModelClient` | 异常上抛 | 所有模型均失败时抛出 `QwenExhaustedError` |
+| `SummaryOrchestrator` | 业务级处理 | 捕获 `QwenExhaustedError`，构建部分结果并推入人工队列 |
+| `ResponseParser` | 解析级重试 | JSON 解析失败时重试（`MAX_RETRIES=2`），属于摘要模块内部逻辑 |
+
+摘要模块只需关注 `QwenExhaustedError` 的捕获处理，不应绕过或重复 `ModelClient` 的重试机制。

@@ -1,6 +1,6 @@
 # 全天录音智能摘要系统 — 架构设计文档
 
-> 生成日期：2026-03-27 | 基于修订版 PRD v2
+> 生成日期：2026-03-27 | 基于修订版 PRD v2 | 审计修复版
 
 ---
 
@@ -303,6 +303,989 @@ flowchart TD
 
 ---
 
+# 共享类型定义 — models/types.py
+
+> **目的**：定义全流水线共享的核心数据类型，作为各模块间的**唯一数据契约**，消除跨模块数据结构不一致问题。
+>
+> **解决的审计阻塞项**：BLOCK-1（Utterance 不兼容）、BLOCK-2（Segment/Chunk 接口断裂）、BLOCK-3（ScoringResult 未定义）、BLOCK-4（短日 Top-K 矛盾）、BLOCK-6（ModelClient 协议缺失）、BLOCK-9（MatchResult 枚举不一致）、BLOCK-10（80K/200K 阈值混淆）。
+>
+> **规则**：所有模块**必须**从 `models/types.py` 导入以下类型，**禁止**自行重新定义同名类。
+
+---
+
+## 目录
+
+1. [基础枚举](#1-基础枚举)
+2. [核心数据类](#2-核心数据类)
+3. [评分相关](#3-评分相关)
+4. [API 相关](#4-api-相关)
+5. [配置常量](#5-配置常量)
+6. [类型关系总览](#6-类型关系总览)
+7. [迁移指引](#7-各模块迁移指引)
+
+---
+
+## 1. 基础枚举
+
+所有枚举统一继承 `str, Enum`，确保 JSON 序列化时直接输出字符串值。
+
+```python
+from __future__ import annotations
+
+from enum import Enum
+from dataclasses import dataclass, field
+from typing import Optional, Protocol, Sequence
+from datetime import datetime
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 1.1 关键人等级
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class KeyPersonLevel(str, Enum):
+    """关键人优先级等级。
+
+    P0: 最高优先级（如 CEO/总裁），基础保障分 80
+    P1: 高优先级（如总监/VP），基础保障分 50
+    P2: 中优先级（如经理），基础保障分 20
+    P3: 普通人员，基础保障分 0
+    """
+    P0 = "P0"
+    P1 = "P1"
+    P2 = "P2"
+    P3 = "P3"
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 1.2 匹配类型（解决 BLOCK-9）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class MatchType(str, Enum):
+    """关键人匹配方式枚举。
+
+    统一各模块的不同命名：
+    - Module 1 旧名 "alias"   → 统一为 FUZZY
+    - Module 1 旧名 "none"    → 统一为 NONE
+    - Module 6 旧名 "unknown" → 统一为 NONE
+    """
+    EXACT = "exact"                 # L1: Speaker ID 或姓名精确匹配
+    ASR_CORRECTED = "asr_corrected" # L1.5: ASR 人名纠错后匹配
+    FUZZY = "fuzzy"                 # L2: 姓名/别名模糊匹配
+    INFERRED = "inferred"           # L3: 内容推断（疑似），自动降级一档
+    NONE = "none"                   # 未匹配到任何关键人
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 1.3 对齐质量
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class AlignmentQuality(str, Enum):
+    """ASR 与说话人分离的时间对齐质量。
+
+    Module 1 原定义不继承 str；Module 2 原定义不继承 str。
+    统一为 str, Enum 以支持 JSON 序列化。
+    """
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 1.4 评分阶段
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class ScoringPhase(str, Enum):
+    """评分器实施阶段。
+
+    MVP: 仅 KeyPersonBaseScore + LLMScore
+    FULL: 引入 DurationScore、ContextScore、TimePeriodCoeff 及回归权重
+    """
+    MVP = "mvp"
+    FULL = "full"
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 1.5 摘要模式
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class SummaryMode(str, Enum):
+    """摘要生成路径模式。
+
+    由 SummaryOrchestrator.select_mode() 决策。
+    消费方根据此值判断应使用 ScoringResult 中的哪组数据：
+    - SHORT_DAY: 使用 all_segments（全量），评分仅用于展示排序
+    - LONG_DAY:  使用 filtered_segments（Top-K），评分用于内容优先级
+    - DEGRADED:  使用 filtered_segments，三级压缩
+    """
+    SHORT_DAY = "short_day"
+    LONG_DAY = "long_day"
+    DEGRADED = "degraded"
+```
+
+---
+
+## 2. 核心数据类
+
+### 2.1 MatchResult（解决 BLOCK-9）
+
+统一替代 Module 1 的 `KeyPersonMatch` 和 Module 6 的 `MatchResult`。
+
+```python
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 等级降级映射（L3 疑似匹配专用）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+INFERRED_LEVEL_DOWNGRADE: dict[KeyPersonLevel, KeyPersonLevel] = {
+    KeyPersonLevel.P0: KeyPersonLevel.P1,   # P0 疑似 → 按 P1 处理
+    KeyPersonLevel.P1: KeyPersonLevel.P2,   # P1 疑似 → 按 P2 处理
+    KeyPersonLevel.P2: KeyPersonLevel.P3,   # P2 疑似 → 按 P3 处理
+    KeyPersonLevel.P3: KeyPersonLevel.P3,   # P3 维持
+}
+
+# 等级 → 基础保障分映射
+LEVEL_BASE_SCORE: dict[KeyPersonLevel, int] = {
+    KeyPersonLevel.P0: 80,
+    KeyPersonLevel.P1: 50,
+    KeyPersonLevel.P2: 20,
+    KeyPersonLevel.P3: 0,
+}
+
+
+@dataclass(frozen=True)
+class MatchResult:
+    """关键人匹配结果。
+
+    统一命名（替代 Module 1 的 KeyPersonMatch 和 Module 6 的 MatchResult）。
+    frozen=True 确保匹配结果一旦产出不可篡改。
+
+    字段说明：
+    - matched_person_id / matched_person_name: 匹配到的关键人标识和姓名。
+      未匹配时均为 None。
+    - level: 关键人的原始配置等级。未匹配时为 None。
+    - original_level: 仅在 match_type == INFERRED 时，记录降级前的原始等级。
+      其他匹配类型下与 level 相同，均为 None（未匹配时）或原始值。
+    - match_type: 匹配方式，取 MatchType 枚举值。
+    - confidence: 匹配置信度，0.0-1.0。未匹配时为 0.0。
+    """
+    matched_person_id: Optional[str]        # 关键人 ID（如 "kp001"），未匹配为 None
+    matched_person_name: Optional[str]       # 关键人姓名，未匹配为 None
+    level: Optional[KeyPersonLevel]          # 配置中的原始等级，未匹配为 None
+    original_level: Optional[KeyPersonLevel] # 降级前等级（仅 INFERRED 时不同于 level）
+    match_type: MatchType                    # 匹配方式
+    confidence: float                        # 匹配置信度 0.0-1.0
+
+    @property
+    def effective_level(self) -> KeyPersonLevel:
+        """有效等级：疑似匹配自动降级一档。
+
+        - EXACT / ASR_CORRECTED / FUZZY → 返回 level 原值
+        - INFERRED → 返回降级后等级（P0→P1, P1→P2, P2→P3, P3→P3）
+        - NONE → 返回 P3
+        """
+        if self.level is None:
+            return KeyPersonLevel.P3
+        if self.match_type == MatchType.INFERRED:
+            return INFERRED_LEVEL_DOWNGRADE[self.level]
+        return self.level
+
+    @property
+    def effective_base_score(self) -> int:
+        """有效等级对应的基础保障分。"""
+        return LEVEL_BASE_SCORE[self.effective_level]
+
+    @property
+    def is_matched(self) -> bool:
+        """是否成功匹配到关键人。"""
+        return self.match_type != MatchType.NONE
+
+    @property
+    def is_suspected(self) -> bool:
+        """是否为疑似匹配（L3 推断）。"""
+        return self.match_type == MatchType.INFERRED
+```
+
+**各匹配层级与 MatchResult 字段对应关系**：
+
+| 匹配层 | match_type | confidence 典型值 | level | effective_level |
+|:---|:---|:---|:---|:---|
+| L1 Speaker ID 精确 | `EXACT` | 0.95-0.98 | 配置等级 | = level |
+| L1.5 ASR 纠错 | `ASR_CORRECTED` | 0.90-0.95 | 配置等级 | = level |
+| L2 模糊匹配 | `FUZZY` | 0.85-0.90 | 配置等级 | = level |
+| L3 内容推断 | `INFERRED` | 0.70-0.85 | 配置等级 | 降级一档 |
+| 未匹配 | `NONE` | 0.0 | None | P3 |
+
+---
+
+### 2.2 Utterance（解决 BLOCK-1）
+
+统一 Module 1 和 Module 2 的两个不兼容 `Utterance` 定义。
+
+```python
+@dataclass(frozen=True)
+class Utterance:
+    """预处理后的最小对话单元（合并后的话语段）。
+
+    这是全流水线的核心数据结构，由 Module 1（预处理层）生产，
+    Module 2（分片引擎）、Module 3（评分器）、Module 4（摘要生成器）消费。
+
+    解决 BLOCK-1 不兼容问题的统一规范：
+    - 时间单位：秒（float），与 Module 2 对齐（Module 1 输出时需 ms → s 转换）
+    - 唯一 ID：utterance_id，格式 "utt_{YYYYMMDD}_{HHMMSS}_{序号:03d}"
+    - token 计数：token_count，预处理阶段用 Qwen3 tokenizer 精确计算
+    - 关键人：使用统一的 MatchResult，替代 Module 1 的 KeyPersonMatch
+    - 不可变：frozen=True，一旦创建不可修改
+    """
+
+    # ---- 标识 ----
+    utterance_id: str
+    """全局唯一标识，格式 "utt_{YYYYMMDD}_{HHMMSS}_{序号:03d}"。"""
+
+    # ---- 说话人 ----
+    speaker_id: str
+    """说话人标识，如 "spk_001"。"""
+
+    speaker_name: Optional[str]
+    """ASR / 配置推断的说话人姓名。AI听记设备提供，可为 None。"""
+
+    # ---- 时间（单位：秒） ----
+    start_time: float
+    """起始时间戳（秒，相对录音起点）。Module 1 输出时由 ms 转换。"""
+
+    end_time: float
+    """结束时间戳（秒，相对录音起点）。"""
+
+    # ---- 文本 ----
+    text: str
+    """ASR 识别文本，由多个 Segment 合并而来。"""
+
+    token_count: int
+    """使用 Qwen3 tokenizer 精确计算的 token 数。
+    预处理阶段一次性计算，避免下游重复分词。"""
+
+    # ---- 置信度 ----
+    asr_confidence: float
+    """ASR 识别置信度（合并后取均值），0.0-1.0。"""
+
+    min_asr_confidence: float
+    """合并前各 Segment 中的最低 ASR 置信度，用于质量判断。"""
+
+    speaker_confidence: float
+    """说话人归属置信度（合并后取均值），0.0-1.0。"""
+
+    alignment_quality: AlignmentQuality
+    """对齐质量（合并后取最差值）。"""
+
+    # ---- 合并元信息 ----
+    segment_count: int
+    """合并前的原始 Segment 数量。"""
+
+    has_overlap: bool
+    """是否包含重叠标记的 Segment（AI听记设备标记）。"""
+
+    # ---- 关键人匹配（由预处理 Step 5 填充） ----
+    key_person_match: MatchResult
+    """关键人匹配结果。未匹配时 match_type == MatchType.NONE。"""
+
+    # ---- 特征（由预处理 Step 4 填充） ----
+    features: Optional["UtteranceFeatures"] = None
+    """结构化特征，供评分和分片使用。Module 1 Step 4 计算填充。"""
+
+    @property
+    def duration(self) -> float:
+        """时长（秒）。"""
+        return self.end_time - self.start_time
+
+    @property
+    def key_person_level(self) -> Optional[KeyPersonLevel]:
+        """便捷属性：关键人有效等级。未匹配返回 None。"""
+        if self.key_person_match.is_matched:
+            return self.key_person_match.effective_level
+        return None
+```
+
+**Module 1 → Module 2 字段映射**：
+
+| Module 1 旧字段 | 统一 Utterance 字段 | 转换说明 |
+|:---|:---|:---|
+| `start_ms: int` | `start_time: float` | `start_ms / 1000.0` |
+| `end_ms: int` | `end_time: float` | `end_ms / 1000.0` |
+| （无） | `utterance_id: str` | 预处理阶段生成 |
+| （无） | `token_count: int` | 预处理阶段用 tokenizer 计算 |
+| `key_person_match: KeyPersonMatch` | `key_person_match: MatchResult` | 类名变更 + 枚举值统一 |
+| `features: UtteranceFeatures` | `features: UtteranceFeatures` | 不变 |
+| `avg_asr_confidence` | `asr_confidence` | 字段名简化 |
+| `worst_alignment` | `alignment_quality` | 字段名统一 |
+
+---
+
+### 2.3 Session
+
+统一替代 Module 1 的 `ProcessedSession` / `ConversationSession` 和 Module 2 的 `Session`。
+
+```python
+@dataclass
+class SessionMetadata:
+    """会话级聚合元信息。"""
+    total_duration_sec: float               # 会话总时长（秒）
+    utterance_count: int                    # utterance 数量
+    speaker_ids: list[str]                  # 出现过的说话人 ID 列表
+    key_person_ids: list[str]               # 匹配到的关键人 ID 列表
+    dominant_speaker_id: Optional[str]      # 发言时长最长的说话人
+    scene_guess: Optional[str]              # 会话级场景推测
+    filtered_segment_count: int = 0         # 置信度过滤掉的原始片段数
+    avg_asr_confidence: float = 0.0         # 会话整体平均 ASR 置信度
+
+
+@dataclass
+class Session:
+    """自然对话会话——L0 硬约束边界单元。
+
+    替代 Module 1 的 ProcessedSession 和 Module 2 的 Session。
+    由会话检测器（SessionDetector）产出，作为分片引擎的硬约束边界。
+
+    任何分片策略都不会跨越 Session 边界。
+    """
+    session_id: str
+    """会话标识，格式 "{device_id}_{序号:03d}" 或 "sess_{序号:03d}"。"""
+
+    utterances: list[Utterance]
+    """包含的有序 Utterance 列表，按 start_time 升序排列。"""
+
+    time_range: tuple[float, float]
+    """起止时间（秒），即 (first_utt.start_time, last_utt.end_time)。"""
+
+    metadata: SessionMetadata
+    """会话级聚合元信息。"""
+
+    gap_before: Optional[float] = None
+    """与前一个 Session 之间的静默时长（秒），首个 Session 为 None。"""
+
+    @property
+    def start_time(self) -> float:
+        return self.time_range[0]
+
+    @property
+    def end_time(self) -> float:
+        return self.time_range[1]
+
+    @property
+    def duration(self) -> float:
+        return self.end_time - self.start_time
+
+    @property
+    def total_tokens(self) -> int:
+        """所有 utterance token 之和。"""
+        return sum(u.token_count for u in self.utterances)
+
+    @property
+    def speaker_set(self) -> set[str]:
+        """出现过的说话人 ID 集合。"""
+        return {u.speaker_id for u in self.utterances}
+
+    @property
+    def has_key_person(self) -> bool:
+        """是否包含 P0 或 P1 关键人。"""
+        return any(
+            u.key_person_level in (KeyPersonLevel.P0, KeyPersonLevel.P1)
+            for u in self.utterances
+        )
+```
+
+---
+
+### 2.4 Chunk（解决 BLOCK-2）
+
+分片引擎的输出单元。增加 `text` 和 `speakers` 字段，解决评分模块无法获取所需数据的问题。
+
+```python
+@dataclass
+class Chunk:
+    """最终分片——送入 LLM 或评分器的处理单元。
+
+    由分片引擎产出。解决 BLOCK-2：评分模块需要的 text 和 speakers 字段
+    现在作为 Chunk 的一等公民提供，无需额外转换。
+    """
+    chunk_id: str
+    """分片标识，格式 "chunk_{序号:03d}"。"""
+
+    sessions: list[Session]
+    """包含的 Session 列表（可能由 AggregatedPack 展开）。"""
+
+    utterances: list[Utterance]
+    """扁平化的全部 Utterance，按时间排序。
+    冗余字段，等价于 [u for s in sessions for u in s.utterances]，
+    预计算以避免下游重复展开。"""
+
+    text: str
+    """拼接文本。由所有 utterance.text 按时间顺序用换行符连接。
+    格式: "[HH:MM:SS] speaker_name: text"
+    供评分模块和摘要模块直接使用。"""
+
+    speakers: list[str]
+    """涉及的所有说话人 ID 列表（去重，按首次出现顺序）。
+    解决 BLOCK-2：评分模块 compute_key_person_base_score 需要此字段。"""
+
+    total_tokens: int
+    """所有 utterance token_count 之和。"""
+
+    strategy_used: str
+    """产生此 Chunk 的策略名。
+    取值: "L1_key_person" | "L2_topic" | "L3_time_window" | "aggregated"。"""
+
+    key_persons_involved: list[str]
+    """涉及的关键人 ID 列表（去重）。"""
+
+    start_time: float = 0.0
+    """第一条 utterance 的 start_time。"""
+
+    end_time: float = 0.0
+    """最后一条 utterance 的 end_time。"""
+
+    label: Optional[str] = None
+    """可读标签，如 "战略研讨会-第2部分，共4部分"。"""
+
+    tail_context_summary: Optional[str] = None
+    """尾部上下文摘要（200-300 字），供下一 Chunk 或合并阶段参考。"""
+
+    boundary_score: float = 0.0
+    """边界质量评分 0.0-1.0。"""
+
+    @property
+    def duration(self) -> float:
+        return self.end_time - self.start_time
+
+
+@dataclass
+class ChunkingResult:
+    """分片引擎总输出。"""
+    chunks: list[Chunk]
+    mode: SummaryMode
+    """当前摘要模式，由 SummaryOrchestrator 决策后传入分片引擎。"""
+    total_tokens: int
+    metadata: dict = field(default_factory=dict)
+    """策略选择日志、边界统计等调试信息。"""
+```
+
+---
+
+## 3. 评分相关（解决 BLOCK-3, BLOCK-4）
+
+### 3.1 ScoreBreakdown
+
+与 Module 3 原定义保持一致，仅将松散的 `str` 类型字段改为对应枚举。
+
+```python
+@dataclass
+class ScoreBreakdown:
+    """单个片段/Chunk 的评分分解记录。
+
+    保留完整的评分分解，服务于调试、可解释性和后续模型迭代。
+    """
+
+    segment_id: str
+    """对应 Chunk.chunk_id 或其他可溯源标识。"""
+
+    # ---- 关键人维度 ----
+    key_person_level: Optional[KeyPersonLevel] = None
+    """关键人原始等级。未匹配时为 None。"""
+
+    match_type: Optional[MatchType] = None
+    """匹配方式。使用统一的 MatchType 枚举，替代原 str 类型。"""
+
+    effective_level: Optional[KeyPersonLevel] = None
+    """疑似降级后的等效等级。非 INFERRED 时与 key_person_level 相同。"""
+
+    key_person_base_score: int = 0
+    """关键人基础保障分（P0=80, P1=50, P2=20, P3=0）。"""
+
+    # ---- LLM 语义维度 ----
+    llm_score: int = 5
+    """LLM 原始语义评分 1-10。解析失败时降级为默认分 5。"""
+
+    llm_score_weighted: int = 50
+    """llm_score * llm_score_multiplier（默认 *10）。"""
+
+    # ---- 连续性保护 ----
+    continuity_bonus: float = 0.0
+    """连续性保护加成分。"""
+
+    continuity_source_segment_id: Optional[str] = None
+    """加成来源片段的 segment_id。"""
+
+    # ---- 完整阶段维度（MVP 阶段为 None） ----
+    duration_score: Optional[float] = None
+    context_score: Optional[float] = None
+    time_period_coeff: Optional[float] = None
+
+    # ---- 最终得分 ----
+    final_score: float = 0.0
+    """MVP: KeyPersonBaseScore + LLMScore * 10 + continuity_bonus"""
+
+    # ---- 筛选结果 ----
+    threshold_applied: int = 60
+    """使用的最低分阈值。"""
+
+    passed_threshold: bool = False
+    """是否通过阈值筛选。"""
+
+    rank_in_topk: Optional[int] = None
+    """Top-K 排名（从 1 开始），未进入 Top-K 为 None。"""
+
+    # ---- 元数据 ----
+    speakers: list[str] = field(default_factory=list)
+    duration_seconds: Optional[float] = None
+    timestamp: Optional[float] = None
+    """片段起始时间（秒）。用于排序。"""
+
+    phase: ScoringPhase = ScoringPhase.MVP
+```
+
+### 3.2 ScoringResult（解决 BLOCK-3, BLOCK-4）
+
+```python
+@dataclass
+class ScoringResult:
+    """评分模块的统一输出包装。
+
+    解决 BLOCK-3：评分→摘要接口断裂。提供结构化的评分输出，
+    替代原来的 tuple[list[Segment], list[ScoreBreakdown]]。
+
+    解决 BLOCK-4：短日模式下 Top-K 筛选与 PRD 矛盾。
+    通过 mode 字段让消费方自行决定使用哪组数据：
+    - SHORT_DAY: 消费方应使用 all_chunks（全量），评分仅用于展示排序
+    - LONG_DAY / DEGRADED: 消费方应使用 filtered_chunks（Top-K 筛选后）
+
+    数据组织：
+    - all_* 字段：全量数据，按时间升序排列
+    - filtered_* 字段：经阈值 + Top-K 筛选后的数据，按分数降序排列
+    """
+
+    # ---- 全量数据（按时间升序） ----
+    all_chunks: list[Chunk]
+    """全部评分片段，按 start_time 升序排列。"""
+
+    all_breakdowns: list[ScoreBreakdown]
+    """全部评分分解，与 all_chunks 一一对应（同序）。"""
+
+    # ---- 筛选后数据（按分数降序） ----
+    filtered_chunks: list[Chunk]
+    """通过阈值 + Top-K 筛选后的片段，按 final_score 降序排列。
+    SHORT_DAY 模式下此列表与 all_chunks 相同（不执行筛选）。"""
+
+    filtered_breakdowns: list[ScoreBreakdown]
+    """与 filtered_chunks 一一对应的评分分解（同序）。"""
+
+    # ---- 模式标记 ----
+    mode: SummaryMode
+    """当前摘要模式。消费方据此决定使用 all_* 还是 filtered_*。"""
+
+    # ---- 评分配置快照 ----
+    config_snapshot: Optional["ScoringConfig"] = None
+    """评分时使用的配置快照，用于审计和复现。"""
+
+    @property
+    def effective_chunks(self) -> list[Chunk]:
+        """根据 mode 返回消费方应使用的 Chunk 列表。
+
+        SHORT_DAY → all_chunks（全量，按时间排序，评分仅用于展示）
+        LONG_DAY / DEGRADED → filtered_chunks（Top-K，按分数排序）
+        """
+        if self.mode == SummaryMode.SHORT_DAY:
+            return self.all_chunks
+        return self.filtered_chunks
+
+    @property
+    def effective_breakdowns(self) -> list[ScoreBreakdown]:
+        """与 effective_chunks 对应的评分分解。"""
+        if self.mode == SummaryMode.SHORT_DAY:
+            return self.all_breakdowns
+        return self.filtered_breakdowns
+```
+
+---
+
+## 4. API 相关（解决 BLOCK-6）
+
+### 4.1 ChatMessage & ChatCompletionResponse
+
+```python
+@dataclass
+class ChatMessage:
+    """LLM 对话消息。
+
+    各模块统一使用此类型构建 messages 列表，
+    替代 Module 4 的 list[dict] 和 Module 5 的 list[ChatMessage]（已统一）。
+    """
+    role: str
+    """消息角色: "system" | "user" | "assistant"。"""
+
+    content: str
+    """消息内容。"""
+
+
+@dataclass
+class TokenUsage:
+    """Token 使用量统计。"""
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    thinking_tokens: int = 0
+    """思考模式下的思维链 token 数。非思考模式为 0。"""
+
+
+@dataclass
+class ChatCompletionResponse:
+    """LLM 调用统一响应结构。
+
+    实时客户端和 Batch 客户端均返回此类型。
+    """
+    content: str
+    """模型生成的回答文本。"""
+
+    usage: TokenUsage
+    """Token 使用量。"""
+
+    model: str
+    """实际使用的模型标识。"""
+
+    thinking_content: Optional[str] = None
+    """思考模式下的思维链原文。非思考模式为 None。"""
+
+    request_id: str = ""
+    """请求 ID（如阿里云请求 ID），用于排查。"""
+
+    finish_reason: str = "stop"
+    """完成原因: "stop" | "length" | "content_filter"。"""
+```
+
+### 4.2 ModelClient 协议（解决 BLOCK-6）
+
+```python
+class ModelClient(Protocol):
+    """LLM 客户端协议。
+
+    解决 BLOCK-6：摘要模块期望 async 方法，API 层定义为同步。
+    所有 LLM 客户端实现（QwenClient、MockClient、BatchClient 等）
+    必须实现此协议。
+
+    使用 Protocol 而非 ABC，允许结构化子类型匹配（鸭子类型），
+    无需显式继承。
+    """
+
+    async def chat_completion(
+        self,
+        messages: list[ChatMessage],
+        *,
+        model: Optional[str] = None,
+        enable_thinking: bool = False,
+        thinking_budget: Optional[int] = None,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+    ) -> ChatCompletionResponse:
+        """发送 Chat Completion 请求并返回统一响应。
+
+        Args:
+            messages: 消息列表，使用 ChatMessage 类型。
+            model: 覆盖默认模型标识。
+            enable_thinking: 启用思考模式。
+            thinking_budget: 思维链 token 上限（仅 enable_thinking=True 时生效）。
+            max_tokens: 输出 token 上限。
+            temperature: 采样温度。
+
+        Returns:
+            ChatCompletionResponse 统一响应。
+
+        Raises:
+            QwenRetryableError: 可重试的 API 错误（429/500/超时）。
+            QwenAPIError: 不可重试的 API 错误（400/401）。
+            QwenExhaustedError: 主模型+降级模型均失败。
+        """
+        ...
+
+    def count_tokens(self, text: str) -> int:
+        """使用模型对应的 tokenizer 精确计算 token 数。"""
+        ...
+
+    def count_messages_tokens(self, messages: list[ChatMessage]) -> int:
+        """计算完整 messages 列表的 token 数（含 role 标记开销）。"""
+        ...
+```
+
+---
+
+## 5. 配置常量（解决 BLOCK-10）
+
+### 5.1 Token 预算阈值
+
+解决 BLOCK-10：明确区分两个不同概念的阈值。
+
+```python
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Token 预算关键阈值（解决 BLOCK-10）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SHORT_DAY_THRESHOLD: int = 80_000
+"""摘要模式切换阈值（tokens）。
+
+用途：SummaryOrchestrator.select_mode() 决策。
+- total_tokens < 80,000 → SHORT_DAY（~90% 工作日）
+- total_tokens 80,000 ~ 250,000 → LONG_DAY（~10% 工作日）
+- total_tokens > 250,000 → DEGRADED
+
+来源：PRD §1.1.4，扣除系统开销后 80K 有效内容恰好填满 262K 上下文。
+此值由 config/model_params.yaml 中的 token_budget.short_day_threshold 配置。
+"""
+
+LONG_DAY_MAX_THRESHOLD: int = 250_000
+"""长日模式上限（tokens）。超过此值降级为三级压缩。"""
+
+CHUNK_TOKEN_BUDGET: int = 200_000
+"""单 Chunk 最大 token 容量。
+
+用途：分片引擎内部参数，决定单个 Chunk 的 token 上限。
+仅在分片引擎切分逻辑中使用，与摘要模式切换无关。
+
+来源：Qwen3-Max 262K 上下文 - 系统提示词(2K) - 关键人注入(600)
+      - 输出预留(32K) - 安全余量(20K) ≈ 200K 可用载荷。
+此值由 config/model_params.yaml 或 chunking_strategy.yaml 配置。
+"""
+
+MODEL_CONTEXT_LIMIT: int = 262_144
+"""Qwen3-Max 上下文窗口大小（tokens）。"""
+
+DEGRADED_MODEL_THRESHOLD: int = 64_000
+"""模型能力下限。低于此值的模型自动降级为三级压缩。"""
+```
+
+### 5.2 阈值关系图
+
+```
+全天 token 总量
+     │
+     ├── < 80K ──────────────────────► SHORT_DAY
+     │                                  └─ 全量送入单次 LLM 调用
+     │                                  └─ Chunk token ≤ 200K（单 Chunk）
+     │
+     ├── 80K ~ 250K ─────────────────► LONG_DAY
+     │                                  └─ 按时段分 2-3 个 Session
+     │                                  └─ 每个 Session ≤ 80K tokens
+     │
+     └── > 250K ─────────────────────► DEGRADED
+                                        └─ 三级压缩：Chunk(3-8K) → Session → Daily
+```
+
+---
+
+## 6. 类型关系总览
+
+```mermaid
+classDiagram
+    direction TB
+
+    class KeyPersonLevel {
+        <<enumeration>>
+        P0
+        P1
+        P2
+        P3
+    }
+
+    class MatchType {
+        <<enumeration>>
+        EXACT
+        ASR_CORRECTED
+        FUZZY
+        INFERRED
+        NONE
+    }
+
+    class AlignmentQuality {
+        <<enumeration>>
+        HIGH
+        MEDIUM
+        LOW
+    }
+
+    class ScoringPhase {
+        <<enumeration>>
+        MVP
+        FULL
+    }
+
+    class SummaryMode {
+        <<enumeration>>
+        SHORT_DAY
+        LONG_DAY
+        DEGRADED
+    }
+
+    class MatchResult {
+        +matched_person_id: str?
+        +matched_person_name: str?
+        +level: KeyPersonLevel?
+        +original_level: KeyPersonLevel?
+        +match_type: MatchType
+        +confidence: float
+        +effective_level: KeyPersonLevel
+        +effective_base_score: int
+        +is_matched: bool
+        +is_suspected: bool
+    }
+
+    class Utterance {
+        +utterance_id: str
+        +speaker_id: str
+        +speaker_name: str?
+        +start_time: float
+        +end_time: float
+        +text: str
+        +token_count: int
+        +asr_confidence: float
+        +alignment_quality: AlignmentQuality
+        +key_person_match: MatchResult
+        +features: UtteranceFeatures?
+        +duration: float
+        +key_person_level: KeyPersonLevel?
+    }
+
+    class Session {
+        +session_id: str
+        +utterances: list~Utterance~
+        +time_range: tuple
+        +metadata: SessionMetadata
+        +gap_before: float?
+        +total_tokens: int
+        +has_key_person: bool
+    }
+
+    class Chunk {
+        +chunk_id: str
+        +sessions: list~Session~
+        +utterances: list~Utterance~
+        +text: str
+        +speakers: list~str~
+        +total_tokens: int
+        +strategy_used: str
+        +key_persons_involved: list~str~
+    }
+
+    class ScoreBreakdown {
+        +segment_id: str
+        +key_person_level: KeyPersonLevel?
+        +match_type: MatchType?
+        +effective_level: KeyPersonLevel?
+        +final_score: float
+        +phase: ScoringPhase
+    }
+
+    class ScoringResult {
+        +all_chunks: list~Chunk~
+        +all_breakdowns: list~ScoreBreakdown~
+        +filtered_chunks: list~Chunk~
+        +filtered_breakdowns: list~ScoreBreakdown~
+        +mode: SummaryMode
+        +effective_chunks: list~Chunk~
+    }
+
+    class ChatMessage {
+        +role: str
+        +content: str
+    }
+
+    class ChatCompletionResponse {
+        +content: str
+        +usage: TokenUsage
+        +model: str
+    }
+
+    class ModelClient {
+        <<protocol>>
+        +chat_completion() ChatCompletionResponse
+        +count_tokens() int
+    }
+
+    MatchResult --> MatchType
+    MatchResult --> KeyPersonLevel
+    Utterance --> MatchResult
+    Utterance --> AlignmentQuality
+    Session --> Utterance
+    Chunk --> Session
+    Chunk --> Utterance
+    ScoreBreakdown --> KeyPersonLevel
+    ScoreBreakdown --> MatchType
+    ScoreBreakdown --> ScoringPhase
+    ScoringResult --> Chunk
+    ScoringResult --> ScoreBreakdown
+    ScoringResult --> SummaryMode
+    ModelClient --> ChatMessage
+    ModelClient --> ChatCompletionResponse
+```
+
+---
+
+## 7. 各模块迁移指引
+
+### Module 1（数据输入 + 预处理）
+
+| 变更项 | 旧 | 新 |
+|:---|:---|:---|
+| `Utterance` 时间 | `start_ms: int`, `end_ms: int` | `start_time: float`, `end_time: float`（秒） |
+| `Utterance` 新增字段 | 无 | `utterance_id`, `token_count` |
+| `KeyPersonMatch` | Module 1 自有定义 | 改用 `MatchResult` |
+| `AlignmentQuality` | `Enum`（不继承 str） | `str, Enum` |
+| match_type 值 `"alias"` | Module 1 旧值 | 改为 `MatchType.FUZZY` |
+| match_type 值 `"none"` | Module 1 旧值 | 改为 `MatchType.NONE` |
+| `ProcessedSession` | Module 1 自有定义 | 改用 `Session` |
+| `Utterance.worst_alignment` | Module 1 字段名 | 改为 `alignment_quality` |
+| `Utterance.avg_asr_confidence` | Module 1 字段名 | 改为 `asr_confidence` |
+
+### Module 2（分片引擎）
+
+| 变更项 | 旧 | 新 |
+|:---|:---|:---|
+| `Utterance` | Module 2 自有定义 | 从 `models/types.py` 导入 |
+| `Session` | Module 2 自有定义 | 从 `models/types.py` 导入，增加 `metadata` 字段 |
+| `Chunk` | 无 `text`/`speakers` | 新增 `text`, `speakers` 字段 |
+| `ChunkingResult.mode` | `str`（"short_day"\|"long_day"） | `SummaryMode` 枚举 |
+| `AlignmentQuality` | `Enum`（不继承 str） | `str, Enum` |
+
+### Module 3（评分器）
+
+| 变更项 | 旧 | 新 |
+|:---|:---|:---|
+| 输入类型 | `Segment`（未定义） | 直接消费 `Chunk` |
+| 输出类型 | `tuple[list, list]` | `ScoringResult` 数据类 |
+| `ScoreBreakdown.match_type` | `Optional[str]` | `Optional[MatchType]` |
+| `ScoreBreakdown.key_person_level` | `Optional[str]` | `Optional[KeyPersonLevel]` |
+| Top-K 筛选 | 所有模式一律执行 | `SHORT_DAY` 模式下 `filtered_chunks = all_chunks` |
+
+### Module 4（摘要生成器）
+
+| 变更项 | 旧 | 新 |
+|:---|:---|:---|
+| 输入 `scoring_result` | 类型未定义 | `ScoringResult`，使用 `effective_chunks` 属性 |
+| `messages` 构建 | `list[dict]` | `list[ChatMessage]` |
+| `model_client` 类型 | 无明确类型 | `ModelClient` 协议 |
+
+### Module 5（API 层）
+
+| 变更项 | 旧 | 新 |
+|:---|:---|:---|
+| `chat_completion` | 同步 `def` | 异步 `async def`（实现 `ModelClient` 协议） |
+| `ChatMessage` | Module 5 自有定义 | 从 `models/types.py` 导入 |
+| `ChatCompletionResponse` | Module 5 自有定义 | 从 `models/types.py` 导入 |
+
+### Module 6（配置管理）
+
+| 变更项 | 旧 | 新 |
+|:---|:---|:---|
+| `PersonLevel` | Module 6 自有定义 | 改用 `KeyPersonLevel` |
+| `MatchType` | Module 6 自有定义（`UNKNOWN` 值） | 从 `models/types.py` 导入（`NONE` 值） |
+| `MatchResult` | Module 6 自有定义（含 `matched_person: KeyPerson`） | 从 `models/types.py` 导入（改用 id + name 扁平字段） |
+
+
+---
+
 # 数据输入层与预处理层 — 模块详细设计
 
 > 对应 PRD §1.1.1（数据输入层）与 §1.1.2（预处理层）。
@@ -564,18 +1547,18 @@ deviation = abs(declared_duration - actual_span) / declared_duration
 
 ### 2.0 预处理流水线总览
 
+<!-- FIXED: BLOCK-5 — 会话检测去重：移除原 Step 1（会话检测），会话检测统一由 Module 2 的 SessionDetector 执行。预处理流水线从五步改为四步。 -->
+
 ```mermaid
 flowchart TD
-    A[SessionRaw 输入] --> B[Step 1: 对话会话检测]
-    B --> C["List[ConversationSession]"]
-    C --> D[Step 2: 置信度分级过滤]
-    D --> E[Step 3: 话语合并]
-    E --> F[Step 4: 特征计算]
-    F --> G[Step 5: 关键人元数据关联]
-    G --> H["List[ProcessedSession] 输出"]
+    A[SessionRaw 输入] --> B[Step 1: 置信度分级过滤]
+    B --> C[Step 2: 话语合并]
+    C --> D[Step 3: 特征计算]
+    D --> E[Step 4: 关键人元数据关联]
+    E --> F["list[Utterance] 扁平输出"]
 ```
 
-预处理层的输入为校验通过的 `SessionRaw`，输出为富含特征标注的 `ProcessedSession` 列表。
+预处理层的输入为校验通过的 `SessionRaw`，输出为扁平的 `list[Utterance]`（引用 `models/types.py` 中的统一 Utterance）。会话检测不在此处执行，统一由下游 Module 2 的 `SessionDetector` 负责。
 
 ```python
 class Preprocessor:
@@ -583,91 +1566,27 @@ class Preprocessor:
         self.config = config
         self.key_people = key_people
 
-    def process(self, session: SessionRaw) -> list[ProcessedSession]:
-        # Step 1: 会话检测 — 切分为多个 ConversationSession
-        conversations = self._detect_conversations(session)
-        results = []
-        for conv in conversations:
-            # Step 2: 置信度过滤（需要关键人信息做分级）
-            cleaned = self._filter_by_confidence(conv)
-            # Step 3: 话语合并
-            utterances = self._merge_utterances(cleaned)
-            # Step 4: 特征计算
-            enriched = self._compute_features(utterances, conv)
-            # Step 5: 关键人元数据关联
-            linked = self._link_key_people(enriched)
-            results.append(ProcessedSession(
-                session_id=conv.session_id,
-                time_range=(conv.start_time, conv.end_time),
-                utterances=linked,
-            ))
-        return results
+    def process(self, session: SessionRaw) -> list[Utterance]:
+        # Step 1: 置信度过滤（需要关键人信息做分级）
+        cleaned = self._filter_by_confidence(session.segments)
+        # Step 2: 话语合并
+        utterances = self._merge_utterances(cleaned)
+        # Step 3: 特征计算
+        enriched = self._compute_features(utterances, session)
+        # Step 4: 关键人元数据关联
+        linked = self._link_key_people(enriched)
+        return linked
 ```
 
-### 2.1 Step 1：对话会话检测
+<!-- FIXED: BLOCK-5 — 原 Step 1（对话会话检测）已移除，会话检测统一由 Module 2 的 SessionDetector 执行。 -->
+
+### 2.1 Step 1：置信度分级过滤
 
 #### 2.1.1 目标
 
-将一段长时间连续录音（如 8-12 小时）按自然对话边界切分为独立的 `ConversationSession`，作为后续所有处理的基本单位。
-
-#### 2.1.2 算法：双条件门控
-
-```
-输入: segments: List[Segment]（已按 start_ms 排序）
-输出: conversations: List[ConversationSession]
-
-当前会话 current = [segments[0]]
-for i in range(1, len(segments)):
-    gap_ms = segments[i].start_ms - segments[i-1].end_ms
-    speaker_changed = segments[i].speaker_id != segments[i-1].speaker_id
-
-    if gap_ms >= SILENCE_THRESHOLD_MS and speaker_changed:
-        # 双条件同时满足 → 会话边界
-        conversations.append(build_conversation(current))
-        current = [segments[i]]
-    else:
-        current.append(segments[i])
-
-conversations.append(build_conversation(current))  # 最后一个会话
-```
-
-**双条件门控的设计理由**：仅靠静默时长会将"一个人长时间思考后继续发言"误判为会话边界；仅靠说话人变化无法区分同一会议内的正常轮流发言。两个条件同时满足才切分。
-
-#### 2.1.3 关键参数
-
-| 参数 | 默认值 | 可配置 | 说明 |
-|:---|:---|:---|:---|
-| `SILENCE_THRESHOLD_MS` | 180,000 (3min) | 是 | 静默时长阈值 |
-| `MIN_CONVERSATION_SEGMENTS` | 2 | 是 | 少于此数的会话合并到相邻会话 |
-
-#### 2.1.4 输出数据结构
-
-```python
-@dataclass
-class ConversationSession:
-    session_id: str               # 自动生成，格式 "{device_id}_{序号:03d}"
-    start_time: datetime          # 会话起始绝对时间
-    end_time: datetime            # 会话结束绝对时间
-    segments: list[Segment]       # 属于本会话的片段集合
-    gap_before_ms: Optional[int]  # 与前一个会话的间隔（首个会话为 None）
-```
-
-#### 2.1.5 异常处理
-
-| 场景 | 处理 |
-|:---|:---|
-| 全部片段构成单一会话（无边界） | 正常返回，仅包含一个 `ConversationSession` |
-| 检测到极短会话（<2 个片段） | 合并至时间最近的相邻会话，记录 WARNING |
-
----
-
-### 2.2 Step 2：置信度分级过滤
-
-#### 2.2.1 目标
-
 根据说话人的关键人等级，分级过滤低置信度片段。关键人的发言采用更宽松的阈值，避免丢失嘈杂环境下的关键指令。
 
-#### 2.2.2 算法
+#### 2.1.2 算法
 
 ```
 输入: segments: List[Segment], key_people: KeyPeopleConfig
@@ -695,9 +1614,9 @@ for seg in segments:
                                           threshold=threshold, level=level))
 ```
 
-**注意**：此步骤需要提前执行一次粗粒度的说话人-关键人匹配（仅 L1 精确匹配），以获得说话人等级。完整的四级匹配在 Step 5 执行。若 L1 匹配不到，视为 `UNKNOWN`，使用最严格阈值 0.60。
+**注意**：此步骤需要提前执行一次粗粒度的说话人-关键人匹配（仅 L1 精确匹配），以获得说话人等级。完整的四级匹配在 Step 4 执行。若 L1 匹配不到，视为 `UNKNOWN`，使用最严格阈值 0.60。
 
-#### 2.2.3 关键参数
+#### 2.1.3 关键参数
 
 | 参数 | 默认值 | 说明 |
 |:---|:---|:---|
@@ -707,26 +1626,30 @@ for seg in segments:
 | `DEFAULT_ASR_THRESHOLD` | 0.60 | P3 及未知说话人 ASR 置信度阈值 |
 | `COLD_START_THRESHOLD_OVERRIDE` | 0.25 | 冷启动期（Day 1-5）全局覆盖阈值 |
 
-#### 2.2.4 异常处理
+#### 2.1.4 异常处理
 
 | 场景 | 处理 |
 |:---|:---|
-| 过滤后某会话片段为空 | 整个 `ConversationSession` 标记为 `LOW_QUALITY`，跳过后续步骤 |
+| 过滤后片段列表为空 | 返回空的 `list[Utterance]`，记录 WARNING |
 | 过滤比例 >80% | 记录 WARNING，可能表明录音环境极差或设备故障 |
 
 ---
 
-### 2.3 Step 3：话语合并
+### 2.2 Step 2：话语合并
 
-#### 2.3.1 目标
+#### 2.2.1 目标
 
 将同一说话人的连续短碎片聚合为语义连贯的 `Utterance`，减少碎片化，同时通过时长上限保证下游分片的灵活性。
 
-#### 2.3.2 算法
+#### 2.2.2 算法
 
+<!-- FIXED: 话语合并增加空列表检查 -->
 ```
 输入: segments: List[Segment]（已过滤）
 输出: utterances: List[Utterance]
+
+if not segments:
+    return []      # 空列表直接返回，不进入合并逻辑
 
 current_group = [segments[0]]
 
@@ -752,58 +1675,73 @@ for i in range(1, len(segments)):
 utterances.append(build_utterance(current_group))  # 最后一组
 ```
 
+<!-- FIXED: BLOCK-1 — build_utterance 输出统一 Utterance（引用 models/types.py） -->
 **`build_utterance` 合并逻辑**：
 
 ```python
-def build_utterance(group: list[Segment]) -> Utterance:
+from models.types import Utterance, AlignmentQuality
+import tiktoken
+
+_encoder = tiktoken.encoding_for_model("gpt-4")  # 或项目统一的 tokenizer
+
+def build_utterance(group: list[Segment], seq_id: int) -> Utterance:
+    merged_text = " ".join(seg.text for seg in group)
     return Utterance(
-        start_ms=group[0].start_ms,
-        end_ms=group[-1].end_ms,
+        utterance_id=f"utt_{group[0].start_ms}_{seq_id:04d}",
         speaker_id=group[0].speaker_id,
-        text=" ".join(seg.text for seg in group),  # 合并文本，空格连接
-        avg_asr_confidence=mean(seg.asr_confidence for seg in group),
-        min_asr_confidence=min(seg.asr_confidence for seg in group),
-        avg_speaker_confidence=mean(seg.speaker_confidence for seg in group),
-        worst_alignment=min(seg.alignment_quality for seg in group, key=quality_rank),
+        speaker_name=group[0].speaker_name,          # 取首条 Segment 的姓名
+        text=merged_text,
+        start_time=group[0].start_ms / 1000.0,       # 毫秒 → 秒
+        end_time=group[-1].end_ms / 1000.0,           # 毫秒 → 秒
+        asr_confidence=mean(seg.asr_confidence for seg in group),  # 取 avg
+        speaker_confidence=mean(seg.speaker_confidence for seg in group),
+        alignment_quality=min(
+            (seg.alignment_quality for seg in group), key=quality_rank
+        ),
+        token_count=len(_encoder.encode(merged_text)),
+        match_result=None,              # Step 4 关键人关联后填充
+        features=None,                  # Step 3 特征计算后填充
         segment_count=len(group),
-        has_overlap=any(seg.is_overlap for seg in group),
     )
 ```
 
-#### 2.3.3 Utterance 数据结构
+#### 2.2.3 Utterance 数据结构（统一定义）
+
+<!-- FIXED: BLOCK-1 — 统一 Utterance 数据结构，定义于 models/types.py，Module 1 生产，Module 2 消费 -->
 
 ```python
-@dataclass
+# 定义于 models/types.py，全局唯一
+@dataclass(frozen=True)
 class Utterance:
-    start_ms: int
-    end_ms: int
-    speaker_id: str
-    text: str
-    # ---- 聚合置信度 ----
-    avg_asr_confidence: float
-    min_asr_confidence: float
-    avg_speaker_confidence: float
-    worst_alignment: AlignmentQuality
-    # ---- 合并元信息 ----
-    segment_count: int          # 合并前的原始 Segment 数量
-    has_overlap: bool           # 是否包含重叠标记的 Segment
-    # ---- 以下字段在 Step 4/5 中填充 ----
-    features: Optional[UtteranceFeatures] = None
-    key_person_match: Optional[KeyPersonMatch] = None
+    utterance_id: str           # 唯一标识
+    speaker_id: str             # 说话人ID
+    speaker_name: Optional[str] # 说话人姓名（可能为空）
+    text: str                   # 合并后的文本
+    start_time: float           # 开始时间（秒）
+    end_time: float             # 结束时间（秒）
+    asr_confidence: float       # ASR 置信度（取 avg）
+    speaker_confidence: float   # 说话人归属置信度
+    alignment_quality: AlignmentQuality
+    token_count: int            # token 数量
+    match_result: Optional[MatchResult]  # 关键人匹配结果
+    features: Optional[UtteranceFeatures]  # 特征（Module 1 计算）
+    segment_count: int          # 合并的原始 segment 数量
 
     @property
-    def duration_ms(self) -> int:
-        return self.end_ms - self.start_ms
+    def duration(self) -> float:
+        return self.end_time - self.start_time
 ```
 
-#### 2.3.4 关键参数
+> **注意**：`frozen=True` 保证 Utterance 不可变。Step 3（特征计算）和 Step 4（关键人关联）通过 `dataclasses.replace()` 返回新实例来填充 `features` 和 `match_result` 字段。
+
+#### 2.2.4 关键参数
 
 | 参数 | 默认值 | 说明 |
 |:---|:---|:---|
 | `MERGE_GAP_THRESHOLD_MS` | 4,000 (4s) | 同一说话人片段间隔 <=此值则合并（PRD 范围 3-5s，取中值） |
 | `MERGE_MAX_DURATION_MS` | 120,000 (120s) | 单个 Utterance 时长上限，超过强制拆分 |
 
-#### 2.3.5 异常处理
+#### 2.2.5 异常处理
 
 | 场景 | 处理 |
 |:---|:---|
@@ -812,13 +1750,13 @@ class Utterance:
 
 ---
 
-### 2.4 Step 4：特征计算
+### 2.3 Step 3：特征计算
 
-#### 2.4.1 目标
+#### 2.3.1 目标
 
 为每个 `Utterance` 附加结构化特征，供下游智能分层和重要性评估使用。
 
-#### 2.4.2 特征字段定义
+#### 2.3.2 特征字段定义
 
 ```python
 @dataclass
@@ -847,96 +1785,129 @@ class UtteranceFeatures:
     scene_guess: Optional[str]       # 场景推测："meeting" | "call" | "dictation" | None
 ```
 
-#### 2.4.3 计算逻辑伪代码
+#### 2.3.3 计算逻辑伪代码
 
 ```python
 def _compute_features(
     self,
     utterances: list[Utterance],
-    conv: ConversationSession,
+    session: SessionRaw,
 ) -> list[Utterance]:
 
-    # 预计算会话级统计
-    total_duration = conv.end_time - conv.start_time
-    speaker_durations: dict[str, int] = defaultdict(int)
+    # 预计算全局统计（注意：此时尚无会话边界，统计基于全部 utterance）
+    total_duration_sec = session.total_duration_ms / 1000.0
+    speaker_durations: dict[str, float] = defaultdict(float)
     speaker_turn_counters: dict[str, int] = defaultdict(int)
 
     for utt in utterances:
-        speaker_durations[utt.speaker_id] += utt.duration_ms
+        speaker_durations[utt.speaker_id] += utt.duration  # duration 单位为秒
 
+    result = []
     for idx, utt in enumerate(utterances):
         speaker_turn_counters[utt.speaker_id] += 1
 
-        utt.features = UtteranceFeatures(
-            duration_sec=utt.duration_ms / 1000.0,
-            start_time_of_day=format_time(conv.start_time, utt.start_ms),
-            time_period=classify_time_period(conv.start_time, utt.start_ms),
-            position_in_session=utt.start_ms / max(1, conv_duration_ms),
+        features = UtteranceFeatures(
+            duration_sec=utt.duration,
+            start_time_of_day=format_time(session.session_start, utt.start_time),
+            time_period=classify_time_period(session.session_start, utt.start_time),
+            position_in_session=utt.start_time / max(0.1, total_duration_sec),
             speaker_id=utt.speaker_id,
             turn_index=idx + 1,
             speaker_turn_count=speaker_turn_counters[utt.speaker_id],
             speaker_duration_ratio=(
-                speaker_durations[utt.speaker_id] / max(1, sum(speaker_durations.values()))
+                speaker_durations[utt.speaker_id] / max(0.1, sum(speaker_durations.values()))
             ),
             char_count=len(utt.text),
-            char_rate=len(utt.text) / max(0.1, utt.duration_ms / 1000.0),
+            char_rate=len(utt.text) / max(0.1, utt.duration),
             sentence_count=count_sentences(utt.text),
             keyword_density=compute_keyword_density(utt.text, KEYWORD_LIST),
             contains_question="？" in utt.text or "吗" in utt.text,
             contains_action_word=any(w in utt.text for w in ACTION_WORDS),
             scene_guess=guess_scene(utt.text),
         )
-    return utterances
+        # frozen=True，通过 replace 返回新实例
+        result.append(dataclasses.replace(utt, features=features))
+    return result
 ```
 
-#### 2.4.4 关键参数与辅助常量
+#### 2.3.4 关键参数与辅助常量
+
+<!-- FIXED: 去掉对未定义的 config/keywords.yaml 的引用，KEYWORD_LIST 直接硬编码在代码中 -->
 
 | 参数 | 默认值 | 说明 |
 |:---|:---|:---|
-| `KEYWORD_LIST` | 配置文件加载 | 业务关键词列表（"预算""决策""风险""合同"等） |
+| `KEYWORD_LIST` | 硬编码列表 | 业务关键词列表：`["预算", "决策", "风险", "合同", "KPI", "营收", "利润", "战略", "竞品", "融资", "股东", "董事会"]`。后续版本可迁移至配置中心统一管理。 |
 | `ACTION_WORDS` | `["决定", "安排", "要求", "通知", "确认", "同意", "否决", "推迟"]` | 行动词集合 |
 | `TIME_PERIOD_BOUNDARIES` | `{"morning": (6,12), "afternoon": (12,18), "evening": (18,24)}` | 时段划分边界（小时） |
 
-#### 2.4.5 `classify_time_period` 逻辑
+#### 2.3.5 `classify_time_period` 逻辑
 
 ```
-hour = (session_start + offset_ms).hour
+hour = (session_start + timedelta(seconds=offset_sec)).hour
 if 6 <= hour < 12:  return "morning"
 if 12 <= hour < 18: return "afternoon"
 return "evening"
 ```
 
+<!-- FIXED: 补充 guess_scene 函数的判断规则 -->
+#### 2.3.6 `guess_scene` 场景推测规则
+
+```python
+SCENE_RULES: list[tuple[str, list[str], int]] = [
+    # (场景标签, 关键词列表, 最低命中数)
+    ("meeting",    ["会议", "议题", "纪要", "参会", "讨论", "决议", "表决"], 2),
+    ("call",       ["电话", "打给", "接听", "通话", "挂断", "拨打"], 1),
+    ("dictation",  ["记录一下", "备忘", "口述", "帮我记", "语音备忘"], 1),
+]
+
+def guess_scene(text: str) -> Optional[str]:
+    """基于关键词命中规则推测 utterance 所属场景。
+
+    规则：按 SCENE_RULES 顺序匹配，首个满足最低命中数的场景胜出。
+    若无命中则返回 None。
+    """
+    for scene, keywords, min_hits in SCENE_RULES:
+        hits = sum(1 for kw in keywords if kw in text)
+        if hits >= min_hits:
+            return scene
+    return None
+```
+
 ---
 
-### 2.5 Step 5：关键人元数据关联
+### 2.4 Step 4：关键人元数据关联
 
-#### 2.5.1 目标
+#### 2.4.1 目标
 
 将每个 Utterance 的 `speaker_id` 关联到关键人配置，输出匹配结果与匹配层级。
 
-#### 2.5.2 处理顺序：L1 → L1.5 → L2 → L3 逐层递进
+#### 2.4.2 处理顺序：L1 → L1.5 → L2 → L3 逐层递进
 
+<!-- FIXED: BLOCK-9 — 统一使用 MatchResult + MatchType 枚举，L2 使用 fuzzy（替代 alias），未匹配使用 none -->
 ```mermaid
 flowchart TD
     S[Utterance.speaker_id] --> L1{L1: Speaker ID 精确匹配}
-    L1 -- 命中 --> R1[match_type=exact, level=配置等级]
+    L1 -- 命中 --> R1[match_type=EXACT, level=配置等级]
     L1 -- 未命中 --> L15{L1.5: ASR 人名纠错匹配}
-    L15 -- 命中 --> R15[match_type=asr_corrected, level=配置等级]
+    L15 -- 命中 --> R15[match_type=ASR_CORRECTED, level=配置等级]
     L15 -- 未命中 --> L2{L2: 姓名/别名模糊匹配}
-    L2 -- 命中 --> R2[match_type=alias, level=配置等级]
+    L2 -- 命中 --> R2[match_type=FUZZY, level=配置等级]
     L2 -- 未命中 --> L3{L3: 内容推断匹配}
-    L3 -- 命中 --> R3["match_type=inferred, level=降一级"]
-    L3 -- 未命中 --> RN[match_type=none, level=UNKNOWN]
+    L3 -- 命中 --> R3["match_type=INFERRED, level=降一级"]
+    L3 -- 未命中 --> RN[match_type=NONE, level=UNKNOWN]
 ```
 
-#### 2.5.3 各层匹配逻辑
+#### 2.4.3 各层匹配逻辑
+
+<!-- FIXED: BLOCK-9 — 所有匹配逻辑统一返回 MatchResult，使用 MatchType 枚举 -->
 
 **L1 — Speaker ID 精确匹配**：
 ```
 for person in key_people:
     if utterance.speaker_id in person.speaker_ids:
-        return KeyPersonMatch(person_id=person.id, level=person.level,
-                              match_type="exact", confidence=0.98)
+        return MatchResult(person_id=person.id, person_name=person.name,
+                           level=person.level, original_level=person.level,
+                           match_type=MatchType.EXACT, confidence=0.98)
 ```
 
 **L1.5 — ASR 人名纠错匹配**：
@@ -947,8 +1918,9 @@ for name in extracted_names:
         if name in correction.variants:
             person = find_person_by_name(correction.target)
             if person:
-                return KeyPersonMatch(person_id=person.id, level=person.level,
-                                      match_type="asr_corrected", confidence=0.92)
+                return MatchResult(person_id=person.id, person_name=person.name,
+                                   level=person.level, original_level=person.level,
+                                   match_type=MatchType.ASR_CORRECTED, confidence=0.92)
 ```
 
 **L2 — 姓名/别名模糊匹配**：
@@ -958,8 +1930,9 @@ candidate_name = utterance.speaker_name or extract_self_introduction(utterance.t
 if candidate_name:
     for person in key_people:
         if fuzzy_match(candidate_name, person.name, person.aliases, threshold=0.8):
-            return KeyPersonMatch(person_id=person.id, level=person.level,
-                                  match_type="alias", confidence=0.87)
+            return MatchResult(person_id=person.id, person_name=person.name,
+                               level=person.level, original_level=person.level,
+                               match_type=MatchType.FUZZY, confidence=0.87)
 ```
 
 **L3 — 内容推断匹配**：
@@ -968,67 +1941,78 @@ if candidate_name:
 inferred_person = infer_speaker_from_context(utterance.text, key_people)
 if inferred_person:
     effective_level = downgrade_level(inferred_person.level)  # P0→P1, P1→P2, P2→P3
-    return KeyPersonMatch(person_id=inferred_person.id, level=effective_level,
-                          match_type="inferred", confidence=0.75)
+    return MatchResult(person_id=inferred_person.id, person_name=inferred_person.name,
+                       level=effective_level, original_level=inferred_person.level,
+                       match_type=MatchType.INFERRED, confidence=0.75)
 ```
 
-#### 2.5.4 匹配结果数据结构
+#### 2.4.4 匹配结果数据结构（统一定义）
+
+<!-- FIXED: BLOCK-9 — 统一 MatchResult，定义于 models/types.py -->
 
 ```python
-@dataclass
-class KeyPersonMatch:
+# 定义于 models/types.py，全局唯一
+
+class MatchType(str, Enum):
+    EXACT = "exact"
+    ASR_CORRECTED = "asr_corrected"
+    FUZZY = "fuzzy"           # 统一，替代原 "alias"
+    INFERRED = "inferred"
+    NONE = "none"             # 统一，替代原 "unknown"
+
+@dataclass(frozen=True)
+class MatchResult:
     person_id: Optional[str]     # 关键人 ID，未匹配时为 None
     person_name: Optional[str]   # 关键人姓名
     level: str                   # 有效等级："P0" | "P1" | "P2" | "P3" | "UNKNOWN"
-    original_level: Optional[str]  # 原始等级（仅 inferred 时与 level 不同）
-    match_type: str              # "exact" | "asr_corrected" | "alias" | "inferred" | "none"
+    original_level: Optional[str]  # 原始等级（仅 INFERRED 时与 level 不同）
+    match_type: MatchType        # 使用 MatchType 枚举
     confidence: float            # 匹配置信度
 ```
 
-#### 2.5.5 异常处理
+#### 2.4.5 异常处理
 
 | 场景 | 处理 |
 |:---|:---|
 | 同一 speaker_id 在不同 Utterance 匹配到不同关键人 | 取置信度最高的匹配结果全局统一，记录 WARNING |
 | L3 推断匹配到多个候选人 | 取置信度最高者，若差距 <0.1 则标记 `ambiguous`，不做匹配 |
-| 关键人配置为空 | 所有 Utterance 的 `key_person_match.match_type` 均为 `none`，正常继续 |
+| 关键人配置为空 | 所有 Utterance 的 `match_result.match_type` 均为 `MatchType.NONE`，正常继续 |
 
 ---
 
-### 2.6 预处理层最终输出
+### 2.5 预处理层最终输出
+
+<!-- FIXED: BLOCK-5 — 输出改为扁平 list[Utterance]，不再包装 ProcessedSession -->
+
+预处理层的最终输出为 **扁平的 `list[Utterance]`**，每个 Utterance 已包含 `features` 和 `match_result` 字段。会话切分由下游 Module 2 的 `SessionDetector` 负责。
 
 ```python
-@dataclass
-class ProcessedSession:
-    session_id: str                          # 会话标识
-    time_range: tuple[datetime, datetime]    # 起止时间
-    utterances: list[Utterance]              # 已关联特征与关键人信息的 Utterance 列表
-    metadata: SessionMetadata                # 会话级聚合元信息
+# 预处理层输出签名
+def process(self, session: SessionRaw) -> list[Utterance]:
+    ...
 
-@dataclass
-class SessionMetadata:
-    total_duration_sec: float
-    utterance_count: int
-    speaker_ids: list[str]
-    key_person_ids: list[str]           # 本会话中匹配到的关键人 ID 列表
-    dominant_speaker_id: Optional[str]  # 发言时长最长的说话人
-    scene_guess: Optional[str]          # 会话级场景推测（取 Utterance 中出现频率最高的场景）
-    filtered_segment_count: int         # Step 2 中被过滤掉的片段数
-    avg_asr_confidence: float           # 会话整体平均 ASR 置信度
+# 输出示例（伪）：
+# [
+#     Utterance(utterance_id="utt_0_0001", speaker_id="spk_001", ...,
+#               features=UtteranceFeatures(...), match_result=MatchResult(...)),
+#     Utterance(utterance_id="utt_3200_0002", speaker_id="spk_002", ...,
+#               features=UtteranceFeatures(...), match_result=MatchResult(...)),
+#     ...
+# ]
 ```
+
+> **元信息说明**：原 `SessionMetadata`（如 `dominant_speaker_id`、`scene_guess`、`avg_asr_confidence`）不再由 Module 1 计算。这些统计信息在 Module 2 完成会话检测后按 Session 粒度计算。
 
 ---
 
-### 2.7 配置汇总（PreprocessorConfig）
+### 2.6 配置汇总（PreprocessorConfig）
+
+<!-- FIXED: BLOCK-5 — 移除 Step 1 会话检测配置；FIXED: 去掉 config/keywords.yaml 引用 -->
 
 ```python
 @dataclass
 class PreprocessorConfig:
-    # Step 1: 会话检测
-    silence_threshold_ms: int = 180_000       # 3 分钟
-    min_conversation_segments: int = 2
-
-    # Step 2: 置信度过滤
+    # Step 1: 置信度过滤
     p0_asr_threshold: float = 0.35
     p1_asr_threshold: float = 0.40
     p2_asr_threshold: float = 0.50
@@ -1036,12 +2020,11 @@ class PreprocessorConfig:
     cold_start_threshold: float = 0.25
     is_cold_start: bool = False               # 冷启动模式开关
 
-    # Step 3: 话语合并
+    # Step 2: 话语合并
     merge_gap_threshold_ms: int = 4_000       # 4 秒
     merge_max_duration_ms: int = 120_000      # 120 秒
 
-    # Step 4: 特征计算
-    keyword_list_path: str = "config/keywords.yaml"
+    # Step 3: 特征计算
     time_period_boundaries: dict[str, tuple[int, int]] = field(
         default_factory=lambda: {
             "morning": (6, 12),
@@ -1050,7 +2033,7 @@ class PreprocessorConfig:
         }
     )
 
-    # Step 5: 关键人匹配
+    # Step 4: 关键人匹配
     asr_corrections_path: str = "config/asr_name_corrections.yaml"
     fuzzy_match_threshold: float = 0.80       # L2 模糊匹配相似度阈值
     inferred_match_min_confidence: float = 0.70  # L3 推断匹配最低置信度
@@ -1089,7 +2072,10 @@ class PreprocessorConfig:
 
 ## 1. 共享数据结构定义
 
-以下类型贯穿三个模块，统一定义于 `core/types.py`。
+<!-- FIXED: BLOCK-1 — 统一引用 models/types.py 中的 Utterance 数据结构，与 Module 1 保持一致 -->
+<!-- FIXED: BLOCK-9 — 统一使用 MatchResult + MatchType 枚举 -->
+
+以下类型贯穿三个模块，统一定义于 `models/types.py`（而非 `core/types.py`），确保 Module 1 生产、Module 2 消费的 Utterance 完全一致。
 
 ```python
 from __future__ import annotations
@@ -1099,37 +2085,80 @@ from typing import Optional, Sequence
 
 # ── 基础枚举 ─────────────────────────────────────────
 
-class AlignmentQuality(Enum):
+class AlignmentQuality(str, Enum):
     HIGH = "high"
     MEDIUM = "medium"
     LOW = "low"
 
-class KeyPersonLevel(Enum):
-    P0 = "P0"
-    P1 = "P1"
-    P2 = "P2"
-    P3 = "P3"
+class MatchType(str, Enum):
+    EXACT = "exact"
+    ASR_CORRECTED = "asr_corrected"
+    FUZZY = "fuzzy"
+    INFERRED = "inferred"
+    NONE = "none"
+
+# ── 匹配结果 ─────────────────────────────────────────
+
+@dataclass(frozen=True)
+class MatchResult:
+    person_id: Optional[str]
+    person_name: Optional[str]
+    level: str                            # "P0" | "P1" | "P2" | "P3" | "UNKNOWN"
+    original_level: Optional[str]
+    match_type: MatchType
+    confidence: float
+
+# ── 特征结构 ─────────────────────────────────────────
+
+@dataclass
+class UtteranceFeatures:
+    duration_sec: float
+    start_time_of_day: str
+    time_period: str
+    position_in_session: float
+    speaker_id: str
+    turn_index: int
+    speaker_turn_count: int
+    speaker_duration_ratio: float
+    char_count: int
+    char_rate: float
+    sentence_count: int
+    keyword_density: float
+    contains_question: bool
+    contains_action_word: bool
+    scene_guess: Optional[str]
 
 # ── 输入层核心结构 ───────────────────────────────────
 
 @dataclass(frozen=True)
 class Utterance:
-    """预处理后的最小对话单元（合并后的话语段）。"""
+    """预处理后的最小对话单元（合并后的话语段）。
+    由 Module 1 生产，Module 2 消费。定义于 models/types.py，全局唯一。
+    """
     utterance_id: str                     # 全局唯一标识，如 "utt_20260327_093012_001"
     speaker_id: str                       # 说话人标识
     speaker_name: Optional[str]           # ASR / 配置推断的姓名
+    text: str                             # ASR 识别文本
     start_time: float                     # 起始时间戳（秒，相对录音起点）
     end_time: float                       # 结束时间戳（秒）
-    text: str                             # ASR 识别文本
-    asr_confidence: float                 # ASR 置信度 0.0-1.0
+    asr_confidence: float                 # ASR 置信度 0.0-1.0（合并时取 avg）
     speaker_confidence: float             # 说话人归属置信度 0.0-1.0
-    alignment_quality: AlignmentQuality   # 对齐质量
-    key_person_level: Optional[KeyPersonLevel]  # 关键人等级（None 表示非关键人）
+    alignment_quality: AlignmentQuality   # 对齐质量，Enum: HIGH/MEDIUM/LOW
     token_count: int                      # 预计算的 token 数
+    match_result: Optional[MatchResult]   # 关键人匹配结果（Module 1 Step 4 填充）
+    features: Optional[UtteranceFeatures] # 特征（Module 1 Step 3 填充）
+    segment_count: int                    # 合并的原始 segment 数量
 
     @property
     def duration(self) -> float:
         return self.end_time - self.start_time
+
+    @property
+    def key_person_level(self) -> Optional[str]:
+        """便捷属性：从 match_result 中提取关键人等级。"""
+        if self.match_result and self.match_result.match_type != MatchType.NONE:
+            return self.match_result.level
+        return None
 
 # ── 会话检测输出 ─────────────────────────────────────
 
@@ -1461,6 +2490,13 @@ flowchart TD
 > 文件：`core/chunking_engine.py`
 > 职责：将会话检测 + 碎片聚合后的处理单元，按照 L0→L1→L2→L3 四级分层策略切分为最终 Chunk，送入 LLM 摘要生成。
 
+<!-- FIXED: BLOCK-10 — 明确区分 80K（摘要模式切换阈值）与 200K（单 Chunk token 上限） -->
+
+> **重要阈值区分**：
+> - `short_day_threshold = 80,000 tokens`：由上游 `SummaryOrchestrator` 判断日类型（短日/长日）。当全天总 token < 80K 时走短日模式（全量单次输入 LLM），分片引擎**不被调用**。
+> - `chunk_token_budget = 200,000 tokens`：分片引擎内部参数，单个 Chunk 的最大 token 容量。仅在 long_day 模式（全天 >= 80K）或 degraded 模式下，分片引擎才被调用，此时每个 Chunk 上限为 200K。
+> - 分片引擎仅在 **long_day / degraded** 模式下被调用，短日模式下整条流水线跳过分片直接进入摘要生成。
+
 ### 4.1 插件化架构设计
 
 分片引擎采用 **策略模式（Strategy Pattern）** + **责任链（Chain of Responsibility）** 混合架构。每一层策略实现统一的抽象接口，引擎按优先级顺序逐层应用。
@@ -1568,7 +2604,11 @@ class ChunkingEngine:
             processing_units=processing_units,
         )
 
-        # 短日判断：无需分片
+        <!-- FIXED: BLOCK-10 — 此处 token_budget=200K 是单 Chunk 容量上限，非短日阈值（80K）。
+             短日/长日模式切换由上游 SummaryOrchestrator 判断（80K 阈值），
+             分片引擎仅在 long_day/degraded 模式下被调用。
+             若全天 token 恰好 < 200K（但 >= 80K），仍打包为单个 Chunk。 -->
+        # 全天总 token 低于单 Chunk 容量：打包为单个 Chunk
         if total_tokens <= self.token_budget:
             return self._build_single_chunk(sessions, context)
 
@@ -1636,7 +2676,7 @@ class ProtectionZone:
     """关键人保护区。"""
     zone_id: str
     key_person_ids: list[str]             # 涉及的关键人
-    key_person_level: KeyPersonLevel      # 最高等级
+    key_person_level: str                 # 最高等级，如 "P0"（来自 Utterance.key_person_level）
     start_time: float
     end_time: float
     utterances: list[Utterance]
@@ -1705,7 +2745,7 @@ class L1KeyPersonStrategy(ChunkingStrategy):
 
         for session in sessions:
             for utt in session.utterances:
-                is_kp = utt.key_person_level in (KeyPersonLevel.P0, KeyPersonLevel.P1)
+                is_kp = utt.key_person_level in ("P0", "P1")
                 if is_kp:
                     if utt.start_time - last_kp_time > self.KEY_PERSON_GAP_THRESHOLD and current_zone_utts:
                         zones.append(self._build_zone(current_zone_utts))
@@ -1725,13 +2765,57 @@ class L1KeyPersonStrategy(ChunkingStrategy):
 
         return zones
 
+    <!-- FIXED: _subdivide_zone 补充伪代码 -->
     def _subdivide_zone(self, zone: ProtectionZone, context: ChunkingContext) -> list[BoundaryCandidate]:
         """超长保护区（>60min）内部再细分。
 
         策略：优先使用 L2 主题边界；若无合适主题边界则退化为时间窗口等分。
         切分后每段标注关联性标签，如 "战略研讨会-第2部分，共4部分"。
         """
-        ...
+        # Step 1: 尝试用 L2 主题边界策略在保护区内部寻找自然切分点
+        l2 = L2TopicBoundaryStrategy()
+        # 构造仅含保护区 utterance 的虚拟处理单元
+        virtual_session = Session(
+            session_id=f"{zone.zone_id}_virtual",
+            utterances=zone.utterances,
+            start_time=zone.start_time,
+            end_time=zone.end_time,
+            total_tokens=zone.total_tokens,
+            speaker_set={u.speaker_id for u in zone.utterances},
+            has_key_person=True,
+            gap_before=None,
+        )
+        inner_candidates = l2.find_boundaries(
+            [virtual_session],
+            context,
+        )
+
+        # Step 2: 筛选——仅保留能将保护区切为 <= MAX_ZONE_DURATION 段的边界
+        target_parts = math.ceil(zone.duration / self.MAX_ZONE_DURATION)
+        if len(inner_candidates) >= target_parts - 1:
+            # 按分数降序取前 target_parts - 1 个，再按时间排序
+            selected = sorted(inner_candidates, key=lambda b: -b.score)[:target_parts - 1]
+            selected.sort(key=lambda b: b.position_time)
+        else:
+            # Step 3: L2 边界不足，退化为等时间窗口切分
+            window = zone.duration / target_parts
+            selected = []
+            for k in range(1, target_parts):
+                t = zone.start_time + window * k
+                selected.append(BoundaryCandidate(
+                    position_time=t,
+                    score=0.5,           # 中等分数，低于 L1 但高于 L3
+                    source=f"{self.name}_subdivide",
+                    utterance_index=self._nearest_utterance_in_zone(t, zone),
+                    is_session_boundary=False,
+                ))
+
+        # Step 4: 为每段标注关联性标签
+        total_parts = len(selected) + 1
+        for idx, boundary in enumerate(selected):
+            boundary.label = f"第{idx + 1}部分，共{total_parts}部分"
+
+        return selected
 
     def validate_chunk(self, chunk, context) -> bool:
         # 校验：P0/P1 关键人的连续对话不被割裂（除非超长再细分）
@@ -1773,7 +2857,8 @@ def _resolve_conflict(
 |:---|:---|:---|:---|
 | 说话人切换 | **0.35** | 滑动窗口（5min）内说话人集合 Jaccard 距离 > 0.5 | 前后各取 5min 窗口比较 |
 | 静默间隔 | **0.35** | 当前 gap 超过局部均值 2 倍标准差 | 局部窗口 = 前后 10min 内的所有 gap |
-| 语义辅助 | **0.30** | 相邻文本窗口 embedding 余弦相似度低于阈值 | text2vec-base-chinese，窗口 500 字 |
+<!-- FIXED: 说明 embedding 模型选型和缓存策略 -->
+| 语义辅助 | **0.30** | 相邻文本窗口 embedding 余弦相似度低于阈值 | **text2vec-base-chinese**（shibing624/text2vec-base-chinese），窗口 500 字。Embedding 在 Module 1 预处理阶段按 500 字滑动窗口预计算并缓存（以 utterance_id + 窗口偏移为 key 存入内存 dict），分片引擎直接查表，避免重复推理。 |
 
 **融合公式**：
 
@@ -1887,6 +2972,8 @@ class L2TopicBoundaryStrategy(ChunkingStrategy):
         if not text_before or not text_after:
             return 0.0
 
+        # _get_embedding 从预计算缓存中查表（key = 文本哈希），
+        # 缓存在 Module 1 预处理阶段由 EmbeddingPrecomputer 填充。
         sim = self._cosine_similarity(
             self._get_embedding(text_before),
             self._get_embedding(text_after),
@@ -1904,6 +2991,12 @@ class L2TopicBoundaryStrategy(ChunkingStrategy):
 
 当 L1、L2 未产生足够切分点时，L3 作为保底按固定窗口切分。
 
+<!-- FIXED: L3 时间窗口说明——30-60min 为正常保底策略，120min 为极端场景上限 -->
+
+> **L3 时间窗口范围说明**：
+> - **30-60 分钟**（`MIN_WINDOW` ~ `MAX_WINDOW`）：常规保底策略的自适应范围。`_adaptive_window` 根据 token 密度在此区间内动态选择窗口大小——密集对话缩短至 30min，稀疏对话拉长至 60min。
+> - **120 分钟**：PRD 中提及的极端场景上限（如全天仅 1 个超长独白 Session，且 L1/L2 均无有效边界）。此时 L3 的 `MAX_WINDOW` 可由 `ChunkingConfig` 覆盖为 120min，作为最终兜底。默认配置下不启用 120min 窗口。
+
 ```python
 class L3TimeWindowStrategy(ChunkingStrategy):
     name = "L3_time_window"
@@ -1911,7 +3004,7 @@ class L3TimeWindowStrategy(ChunkingStrategy):
 
     DEFAULT_WINDOW = 2700.0                # 默认窗口 45 分钟
     MIN_WINDOW = 1800.0                    # 最小 30 分钟
-    MAX_WINDOW = 3600.0                    # 最大 60 分钟
+    MAX_WINDOW = 3600.0                    # 最大 60 分钟（极端场景可由配置覆盖为 7200.0 即 120 分钟）
 
     def find_boundaries(self, units, context) -> list[BoundaryCandidate]:
         total_duration = context.sessions[-1].end_time - context.sessions[0].start_time
@@ -2068,7 +3161,7 @@ def _attach_tail_context(self, chunks: list[Chunk]) -> None:
         # 提取摘要要素
         speakers = list({u.speaker_name or u.speaker_id for u in tail_utts})
         key_persons = [u.speaker_name or u.speaker_id for u in tail_utts
-                       if u.key_person_level in (KeyPersonLevel.P0, KeyPersonLevel.P1)]
+                                      if u.key_person_level in ("P0", "P1")]
         last_text = " ".join(u.text for u in tail_utts[-3:])  # 最后 3 句原文
         time_range = f"{self._format_time(tail_utts[0].start_time)}-{self._format_time(tail_utts[-1].end_time)}"
 
@@ -2079,7 +3172,8 @@ def _attach_tail_context(self, chunks: list[Chunk]) -> None:
             f"末尾话题: {last_text[:200]}"
         )
 
-        chunk.tail_context_summary = summary[:400]  # 硬截断 400 字
+        <!-- FIXED: 尾部上下文摘要截断改为 300 字，与 PRD 200-300 字要求对齐 -->
+        chunk.tail_context_summary = summary[:300]  # 硬截断 300 字
 ```
 
 **完整阶段增强方案**（MVP 后）：尾部上下文摘要可替换为轻量级 LLM 调用（`max_tokens=200`），生成更精炼的语义摘要而非规则拼接。
@@ -2088,9 +3182,9 @@ def _attach_tail_context(self, chunks: list[Chunk]) -> None:
 
 ```mermaid
 flowchart TD
-    A[输入: Session 列表 + 聚合后处理单元] --> B{total_tokens <= budget?}
-    B -- 是 --> C[短日模式: 全量打包为单个 Chunk]
-    B -- 否 --> D[长日模式: 启动策略链]
+    A[输入: Session 列表 + 聚合后处理单元<br>仅 long_day/degraded 模式调用] --> B{total_tokens <= chunk_token_budget 200K?}
+    B -- 是 --> C[单 Chunk 模式: 全量打包为单个 Chunk]
+    B -- 否 --> D[多 Chunk 模式: 启动策略链]
 
     D --> E[L0: 收集 Session 边界<br>硬约束]
     E --> F[L1: 检测关键人保护区<br>优先约束]
@@ -2122,7 +3216,7 @@ flowchart TD
 | | `pack_duration_limit` | 900s（15min） | 聚合包时长上限 |
 | | `proximity_threshold` | 600s（10min） | 时间邻近性阈值 |
 | | `min_aggregation_count` | 2 | 最少聚合 Session 数 |
-| **分片引擎** | `token_budget` | 200,000 | 单 Chunk token 上限 |
+| **分片引擎** | `token_budget` | 200,000 | 单 Chunk token 上限（`chunk_token_budget`）。注意：短日模式阈值 80K 由 SummaryOrchestrator 管理，分片引擎不涉及 |
 | | `soft_boundary_range` | (60s, 90s) | 软边界搜索范围 |
 | **L1 关键人保护** | `KEY_PERSON_GAP_THRESHOLD` | 120s（2min） | 关键人对话间隔容忍 |
 | | `MAX_ZONE_DURATION` | 3600s（60min） | 保护区上限 |
@@ -2139,7 +3233,7 @@ flowchart TD
 | | `MIN_BOUNDARY_INTERVAL` | 120s | 相邻边界最小间隔 |
 | **L3 时间窗口** | `DEFAULT_WINDOW` | 2700s（45min） | 默认切分窗口 |
 | | `MIN_WINDOW` | 1800s（30min） | 最小窗口 |
-| | `MAX_WINDOW` | 3600s（60min） | 最大窗口 |
+| | `MAX_WINDOW` | 3600s（60min） | 最大窗口（极端场景可配置覆盖为 7200s/120min） |
 
 ---
 
@@ -2157,6 +3251,67 @@ flowchart TD
 ---
 
 ## 6.1 数据模型（models/scoring.py）
+
+<!-- FIXED: BLOCK-2 — 评分模块直接使用分片引擎输出的 Chunk 类型，不再使用未定义的 Segment -->
+
+### 6.1.0 Chunk 类型说明与 LLMClient / match_speaker_to_key_person 接口
+
+评分模块的输入片段类型统一为分片引擎输出的 `Chunk`（定义于 `models/types.py`）。
+原文档中的 `Segment` 即 `Chunk`，不再单独定义 `Segment` 类型。
+
+```python
+from models.types import Chunk
+# 评分模块中所有"片段"均为 Chunk，关键字段映射：
+#   chunk.chunk_id   — 片段唯一标识（原 segment.id）
+#   chunk.text       — 拼接后的文本（原 segment.text）
+#   chunk.speakers   — 说话人列表（原 segment.speakers）
+#   chunk.start_time — 片段起始时间，float 秒（原 segment.start_time）
+#   chunk.end_time   — 片段结束时间，float 秒
+#   chunk.total_tokens — 片段 token 数
+```
+
+<!-- FIXED: 补充 LLMClient 接口定义，指向 ModelClient 协议 -->
+
+**LLMClient 接口**：评分模块中引用的 `LLMClient` 实际对应 API 层定义的 `ModelClient` 协议
+（定义于 `core/model_client.py`）。评分模块通过依赖注入获取该客户端实例：
+
+```python
+from typing import Protocol
+
+class ModelClient(Protocol):
+    """模型客户端协议（定义于 core/model_client.py）。
+    评分模块中的 LLMClient 即此协议。"""
+
+    async def chat_completion(
+        self,
+        messages: list[dict],
+        max_tokens: int = 2048,
+        temperature: float = 0.7,
+        enable_thinking: bool = False,
+    ) -> "ChatCompletionResponse": ...
+```
+
+<!-- FIXED: 补充 match_speaker_to_key_person 函数签名 -->
+
+**match_speaker_to_key_person 函数**：由配置模块的 `KeyPersonMatcher` 提供
+（定义于 `core/key_person_matcher.py`）：
+
+```python
+from models.types import MatchResult
+
+def match_speaker_to_key_person(
+    speaker: str,
+    key_people_config: dict,
+) -> MatchResult | None:
+    """将说话人名称匹配至关键人配置。
+
+    Returns:
+        MatchResult(level="P0"~"P3", match_type="exact"|"alias"|"fuzzy"|"inferred")
+        若无匹配返回 None。
+    详见配置模块 KeyPersonMatcher 实现。
+    """
+    ...
+```
 
 ### 6.1.1 ScoringPhase 枚举
 
@@ -2245,7 +3400,7 @@ from datetime import datetime
 class ScoreBreakdown:
     """单个片段的评分分解记录。"""
 
-    segment_id: str
+    segment_id: str                      # 对应 Chunk.chunk_id
 
     # ---- 关键人维度 ----
     key_person_level: Optional[str]      # "P0" / "P1" / "P2" / "P3" / None
@@ -2281,7 +3436,39 @@ class ScoreBreakdown:
     phase: ScoringPhase = ScoringPhase.MVP
 ```
 
-### 6.1.4 数据模型关系图
+<!-- FIXED: BLOCK-3 — 新增 ScoringResult 数据类，替代裸 tuple 返回 -->
+
+### 6.1.4 ScoringResult 数据类
+
+评分模块的统一输出容器，替代原有的裸 `tuple` 返回。同时提供"按分数降序"和"按时间升序"两个视图。
+
+```python
+from dataclasses import dataclass
+from models.types import Chunk, SummaryMode
+
+@dataclass
+class ScoringResult:
+    """评分模块统一输出。evaluate() 返回此类型而非裸 tuple。"""
+
+    all_chunks: list[Chunk]                # 全量片段，按时间升序
+    all_breakdowns: list[ScoreBreakdown]   # 全量评分记录，与 all_chunks 一一对应
+    filtered_chunks: list[Chunk]           # Top-K 筛选后，按分数降序
+    filtered_breakdowns: list[ScoreBreakdown]  # 与 filtered_chunks 一一对应
+    mode: SummaryMode                      # SHORT_DAY / LONG_DAY / DEGRADED
+
+    def filtered_by_time(self) -> tuple[list[Chunk], list[ScoreBreakdown]]:
+        """返回筛选后片段按时间升序排列的视图（摘要生成模块需要此顺序）。"""
+        paired = list(zip(self.filtered_chunks, self.filtered_breakdowns))
+        paired.sort(key=lambda pair: pair[0].start_time)
+        return [c for c, _ in paired], [b for _, b in paired]
+```
+
+> **输出视图说明**：
+> - `filtered_chunks` / `filtered_breakdowns`：按 FinalScore **降序**，用于调试和重要性展示。
+> - `filtered_by_time()`：按 `start_time` **升序**，用于摘要生成模块按时间线拼接文本。
+> - `all_chunks` / `all_breakdowns`：全量数据按时间升序，SHORT_DAY 模式下 `filtered_chunks == all_chunks`。
+
+### 6.1.5 数据模型关系图
 
 ```mermaid
 classDiagram
@@ -2328,8 +3515,19 @@ classDiagram
         +phase: ScoringPhase
     }
 
+    class ScoringResult {
+        +all_chunks: list~Chunk~
+        +all_breakdowns: list~ScoreBreakdown~
+        +filtered_chunks: list~Chunk~
+        +filtered_breakdowns: list~ScoreBreakdown~
+        +mode: SummaryMode
+        +filtered_by_time() tuple
+    }
+
     ScoringConfig --> ScoringPhase
     ScoreBreakdown --> ScoringPhase
+    ScoringResult --> ScoreBreakdown
+    ScoringResult --> ScoringPhase
 ```
 
 ---
@@ -2340,12 +3538,15 @@ classDiagram
 
 ```mermaid
 flowchart TD
-    A[输入: 片段列表 + 关键人配置] --> B[Step 1: 计算 KeyPersonBaseScore]
+    A["输入: Chunk 列表 + 关键人配置 + mode"] --> B[Step 1: 计算 KeyPersonBaseScore]
     B --> C[Step 2: LLM 批量评分]
     C --> D[Step 3: 合成 FinalScore]
     D --> E[Step 4: 连续性保护]
-    E --> F[Step 5: 阈值筛选 + Top-K]
-    F --> G[输出: 排序片段列表 + ScoreBreakdown 列表]
+    E --> F{"mode == SHORT_DAY?"}
+    F -- 是 --> G["跳过 Top-K，全量输出"]
+    F -- 否 --> H["Step 5: 阈值筛选 + Top-K"]
+    G --> I["输出: ScoringResult<br/>(全量 + 筛选 + 双视图)"]
+    H --> I
 ```
 
 ### 6.2.2 KeyPersonBaseScore 计算逻辑
@@ -2354,7 +3555,7 @@ flowchart TD
 
 ```python
 def compute_key_person_base_score(
-    segment: Segment,
+    chunk: Chunk,
     key_people_config: dict,
     config: ScoringConfig,
 ) -> tuple[int, str | None, str | None, str | None]:
@@ -2369,7 +3570,7 @@ def compute_key_person_base_score(
 
     LEVEL_PRIORITY = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 
-    for speaker in segment.speakers:
+    for speaker in chunk.speakers:
         match = match_speaker_to_key_person(speaker, key_people_config)
         if match is None:
             continue
@@ -2412,7 +3613,7 @@ def compute_key_person_base_score(
 #### 分批逻辑
 
 ```python
-def batch_segments(segments: list[Segment], batch_size: int) -> list[list[Segment]]:
+def batch_segments(segments: list[Chunk], batch_size: int) -> list[list[Chunk]]:
     """将片段列表按 batch_size 切分为多个批次。"""
     return [
         segments[i : i + batch_size]
@@ -2430,7 +3631,7 @@ LLM_SCORING_PROMPT_TEMPLATE = """请评估以下 {n} 个对话片段的重要性
 
 请按顺序输出 {n} 个分数，用逗号分隔，仅输出数字。"""
 
-def build_scoring_prompt(batch: list[Segment]) -> str:
+def build_scoring_prompt(batch: list[Chunk]) -> str:
     """构造单批次的评分 Prompt。"""
     parts = []
     for i, seg in enumerate(batch, 1):
@@ -2448,8 +3649,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 async def call_llm_for_scores(
-    batch: list[Segment],
-    llm_client: LLMClient,
+    batch: list[Chunk],
+    llm_client: ModelClient,
     config: ScoringConfig,
 ) -> list[int]:
     """调用 LLM 对一批片段进行语义评分。
@@ -2462,7 +3663,8 @@ async def call_llm_for_scores(
     """
     prompt = build_scoring_prompt(batch)
 
-    response = await llm_client.complete(
+    # <!-- FIXED: BLOCK-2 — llm_client.complete() → chat_completion()，与 ModelClient 协议一致 -->
+    response = await llm_client.chat_completion(
         messages=[{"role": "user", "content": prompt}],
         max_tokens=config.llm_max_tokens,       # 64
         temperature=config.llm_temperature,      # 0.0
@@ -2592,17 +3794,19 @@ $$\text{bonus} = \text{neighbor\_score} \times 0.3 \times \max\left(0,\ 1 - \fra
 
 ### 6.3.4 算法伪代码
 
+<!-- FIXED: .total_seconds() 类型错误 — start_time/end_time 已经是 float 秒，直接做差除以 60 -->
+
 ```python
 def apply_continuity_protection(
-    segments: list[Segment],
+    chunks: list[Chunk],
     breakdowns: list[ScoreBreakdown],
     config: ScoringConfig,
 ) -> list[ScoreBreakdown]:
     """对已计算 FinalScore 的片段列表应用连续性保护。
 
-    前提：segments 和 breakdowns 按时间顺序一一对应。
+    前提：chunks 和 breakdowns 按时间顺序一一对应。
     """
-    n = len(segments)
+    n = len(chunks)
     # 记录每个片段的原始 FinalScore（不含 bonus），用于传播计算
     original_scores = [bd.final_score for bd in breakdowns]
 
@@ -2621,9 +3825,10 @@ def apply_continuity_protection(
                 continue
 
             # 计算时间间隔（分钟）
+            # NOTE: start_time / end_time 均为 float（秒），直接做差即可，无需 .total_seconds()
             interval = abs(
-                segments[i].start_time - segments[neighbor_idx].end_time
-            ).total_seconds() / 60.0
+                chunks[i].start_time - chunks[neighbor_idx].end_time
+            ) / 60.0
 
             # 超过最大间隔则不传播
             if interval >= config.continuity_max_interval:
@@ -2710,10 +3915,10 @@ import math
 from typing import Optional
 
 def filter_and_rank(
-    segments: list[Segment],
+    chunks: list[Chunk],
     breakdowns: list[ScoreBreakdown],
     config: ScoringConfig,
-) -> tuple[list[Segment], list[ScoreBreakdown]]:
+) -> tuple[list[Chunk], list[ScoreBreakdown]]:
     """阈值筛选 + Top-K 排序。
 
     Returns:
@@ -2721,8 +3926,8 @@ def filter_and_rank(
     """
     # Step 1: 阈值筛选
     candidates = [
-        (seg, bd)
-        for seg, bd in zip(segments, breakdowns)
+        (chunk, bd)
+        for chunk, bd in zip(chunks, breakdowns)
         if bd.final_score >= config.threshold
     ]
 
@@ -2755,15 +3960,15 @@ def filter_and_rank(
     for rank, (_, bd) in enumerate(selected, 1):
         bd.rank_in_topk = rank
 
-    result_segments = [seg for seg, _ in selected]
+    result_chunks = [chunk for chunk, _ in selected]
     result_breakdowns = [bd for _, bd in selected]
 
     logger.info(
         "筛选完成: 总数=%d, 过阈值=%d, Top-K=%d, K_effective=%d, 最终保留=%d",
-        len(segments), len(candidates), k, k_effective, len(selected),
+        len(chunks), len(candidates), k, k_effective, len(selected),
     )
 
-    return result_segments, result_breakdowns
+    return result_chunks, result_breakdowns
 ```
 
 ### 6.4.4 筛选流程图
@@ -2779,7 +3984,7 @@ flowchart TD
     F --> H["Step 3: 取前 K_eff 个片段"]
     G --> H
     H --> I["标记 rank_in_topk"]
-    I --> J["输出: 排序片段列表 + ScoreBreakdown 列表"]
+    I --> J["输出: 筛选后 Chunk 列表 + ScoreBreakdown（按分数降序）"]
 ```
 
 ---
@@ -2790,31 +3995,52 @@ flowchart TD
 
 完整阶段评分器继承 MVP 评分器，在其基础上扩展三个新维度并引入权重配置。
 
+<!-- FIXED: BLOCK-3 — evaluate() 返回 ScoringResult 而非裸 tuple -->
+<!-- FIXED: BLOCK-4 — evaluate() 增加 mode: SummaryMode 参数，SHORT_DAY 跳过 Top-K -->
+<!-- FIXED: 补充 LLMClient 指向 ModelClient 协议 -->
+
 ```python
 import math
+from models.types import SummaryMode
 
 class MVPImportanceEvaluator:
     """MVP 阶段重要性评估器。"""
 
-    def __init__(self, config: ScoringConfig, llm_client: LLMClient):
+    def __init__(self, config: ScoringConfig, llm_client: ModelClient):
+        """
+        Args:
+            config: 评分配置
+            llm_client: 模型客户端，实现 ModelClient 协议（定义于 core/model_client.py）
+        """
         self.config = config
         self.llm_client = llm_client
 
     async def evaluate(
         self,
-        segments: list[Segment],
+        chunks: list[Chunk],
         key_people_config: dict,
-    ) -> tuple[list[Segment], list[ScoreBreakdown]]:
-        """完整评估流程：基础分 → LLM评分 → 合成 → 连续性 → 筛选。"""
+        mode: SummaryMode = SummaryMode.LONG_DAY,
+    ) -> ScoringResult:
+        """完整评估流程：基础分 → LLM评分 → 合成 → 连续性 → 筛选。
+
+        Args:
+            chunks: 分片引擎输出的 Chunk 列表（按时间升序）
+            key_people_config: 关键人配置字典
+            mode: 摘要模式。SHORT_DAY 跳过 Top-K 筛选，全量输出；
+                  LONG_DAY / DEGRADED 执行正常的阈值 + Top-K 筛选。
+
+        Returns:
+            ScoringResult 包含全量和筛选后的两组数据，以及模式标记。
+        """
         breakdowns = []
 
         # Step 1: KeyPersonBaseScore
-        for seg in segments:
+        for chunk in chunks:
             base_score, level, match_type, eff_level = (
-                compute_key_person_base_score(seg, key_people_config, self.config)
+                compute_key_person_base_score(chunk, key_people_config, self.config)
             )
             bd = ScoreBreakdown(
-                segment_id=seg.id,
+                segment_id=chunk.chunk_id,  # Chunk.chunk_id 作为片段唯一标识
                 key_person_level=level,
                 match_type=match_type,
                 effective_level=eff_level,
@@ -2824,7 +4050,7 @@ class MVPImportanceEvaluator:
             breakdowns.append(bd)
 
         # Step 2: LLM 批量评分
-        llm_scores = await self._batch_llm_scoring(segments)
+        llm_scores = await self._batch_llm_scoring(chunks)
         for bd, score in zip(breakdowns, llm_scores):
             bd.llm_score = score
             bd.llm_score_weighted = score * self.config.llm_score_multiplier
@@ -2834,19 +4060,44 @@ class MVPImportanceEvaluator:
             bd.final_score = self._compute_final_score(bd)
 
         # Step 4: 连续性保护
-        breakdowns = apply_continuity_protection(segments, breakdowns, self.config)
+        breakdowns = apply_continuity_protection(chunks, breakdowns, self.config)
 
-        # Step 5: 阈值 + Top-K
-        return filter_and_rank(segments, breakdowns, self.config)
+        # Step 5: 阈值 + Top-K（根据 mode 决定是否跳过）
+        if mode == SummaryMode.SHORT_DAY:
+            # 短日模式：跳过 Top-K 筛选，评分仅用于排序展示，不裁剪内容
+            # filtered = all（全量），但仍按分数降序排列以便展示
+            sorted_pairs = sorted(
+                zip(chunks, breakdowns),
+                key=lambda pair: pair[1].final_score,
+                reverse=True,
+            )
+            filtered_chunks = [c for c, _ in sorted_pairs]
+            filtered_breakdowns = [b for _, b in sorted_pairs]
+            for rank, bd in enumerate(filtered_breakdowns, 1):
+                bd.passed_threshold = True
+                bd.rank_in_topk = rank
+        else:
+            # LONG_DAY / DEGRADED：执行正常的阈值 + Top-K 筛选
+            filtered_chunks, filtered_breakdowns = filter_and_rank(
+                chunks, breakdowns, self.config
+            )
+
+        return ScoringResult(
+            all_chunks=chunks,                       # 按时间升序（原始顺序）
+            all_breakdowns=breakdowns,               # 与 all_chunks 一一对应
+            filtered_chunks=filtered_chunks,         # 按分数降序
+            filtered_breakdowns=filtered_breakdowns, # 与 filtered_chunks 一一对应
+            mode=mode,
+        )
 
     def _compute_final_score(self, bd: ScoreBreakdown) -> float:
         """MVP: FinalScore = KeyPersonBaseScore + LLMScore × 10"""
         return bd.key_person_base_score + bd.llm_score_weighted
 
-    async def _batch_llm_scoring(self, segments: list[Segment]) -> list[int]:
+    async def _batch_llm_scoring(self, chunks: list[Chunk]) -> list[int]:
         """分批调用 LLM 获取所有片段的语义评分。"""
         all_scores: list[int] = []
-        batches = batch_segments(segments, self.config.llm_batch_size)
+        batches = batch_segments(chunks, self.config.llm_batch_size)
         for batch in batches:
             scores = await call_llm_for_scores(batch, self.llm_client, self.config)
             all_scores.extend(scores)
@@ -2859,7 +4110,7 @@ class FullImportanceEvaluator(MVPImportanceEvaluator):
     def __init__(
         self,
         config: ScoringConfig,
-        llm_client: LLMClient,
+        llm_client: ModelClient,
         time_period_config: list[dict] | None = None,
     ):
         super().__init__(config, llm_client)
@@ -2892,7 +4143,7 @@ class FullImportanceEvaluator(MVPImportanceEvaluator):
         saturation = self.config.duration_saturation_minutes  # 30
         return 100.0 * math.log(1 + duration_min) / math.log(1 + saturation)
 
-    def _compute_context_score(self, segment: Segment) -> float:
+    def _compute_context_score(self, chunk: Chunk) -> float:
         """ContextScore: 结构特征评分（预留接口）。
 
         可参考特征：对话轮次数、发言人数量、发言比例均衡度等。
@@ -2937,17 +4188,17 @@ class FullImportanceEvaluator(MVPImportanceEvaluator):
 classDiagram
     class MVPImportanceEvaluator {
         #config: ScoringConfig
-        #llm_client: LLMClient
-        +evaluate(segments, key_people_config)
+        #llm_client: ModelClient
+        +evaluate(chunks, key_people_config, mode) ScoringResult
         #_compute_final_score(bd) float
-        #_batch_llm_scoring(segments) list~int~
+        #_batch_llm_scoring(chunks) list~int~
     }
 
     class FullImportanceEvaluator {
         -time_period_config: list
         #_compute_final_score(bd) float
         -_compute_duration_score(duration_seconds) float
-        -_compute_context_score(segment) float
+        -_compute_context_score(chunk) float
         -_compute_time_period_coeff(timestamp) float
     }
 
@@ -2969,7 +4220,7 @@ flowchart TD
     F --> G["Step 6: 加权合成 FinalScore<br/>w1×KP + w2×LLM×10 + w3×Dur + w4×Ctx + w5×TP"]
     G --> H["Step 7: 连续性保护<br/>(同 MVP)"]
     H --> I["Step 8: 阈值 + Top-K<br/>(同 MVP)"]
-    I --> J[输出: 排序片段列表 + ScoreBreakdown]
+    I --> J["输出: ScoringResult<br/>(含全量+筛选, 双视图)"]
 ```
 
 ---
@@ -2981,15 +4232,18 @@ flowchart TD
 | `ScoringPhase` | `models/scoring.py` | 评分阶段枚举 |
 | `ScoringConfig` | `models/scoring.py` | 评分参数配置 |
 | `ScoreBreakdown` | `models/scoring.py` | 评分分解记录 |
-| `compute_key_person_base_score()` | `core/importance_evaluator.py` | 计算关键人基础分 |
+| `ScoringResult` | `models/scoring.py` | 评分模块统一输出容器（含全量+筛选两组数据） <!-- FIXED: BLOCK-3 --> |
+| `compute_key_person_base_score()` | `core/importance_evaluator.py` | 计算关键人基础分（输入 `Chunk`） |
 | `batch_segments()` | `core/importance_evaluator.py` | 片段分批 |
 | `build_scoring_prompt()` | `core/importance_evaluator.py` | 构造 LLM 评分 Prompt |
-| `call_llm_for_scores()` | `core/importance_evaluator.py` | 单批次 LLM 调用 |
+| `call_llm_for_scores()` | `core/importance_evaluator.py` | 单批次 LLM 调用（通过 `ModelClient` 协议） |
 | `parse_llm_scores()` | `core/importance_evaluator.py` | 解析 LLM 响应 |
 | `apply_continuity_protection()` | `core/importance_evaluator.py` | 连续性保护 |
 | `filter_and_rank()` | `core/importance_evaluator.py` | 阈值 + Top-K 筛选 |
-| `MVPImportanceEvaluator` | `core/importance_evaluator.py` | MVP 评分器主类 |
+| `MVPImportanceEvaluator` | `core/importance_evaluator.py` | MVP 评分器主类（`evaluate()` 返回 `ScoringResult`，支持 `mode` 参数） |
 | `FullImportanceEvaluator` | `core/importance_evaluator.py` | 完整阶段评分器（预留） |
+| `match_speaker_to_key_person()` | `core/key_person_matcher.py` | 说话人→关键人匹配（由配置模块 KeyPersonMatcher 提供） |
+| `ModelClient` (协议) | `core/model_client.py` | LLM 客户端协议（原文档中的 LLMClient） |
 
 
 ---
@@ -2998,6 +4252,17 @@ flowchart TD
 
 > 对应源码：`core/summarizer.py`、`models/summary.py`、`prompts/`
 > 依据 PRD §5 多级摘要生成流程
+
+<!-- FIXED: BLOCK-6 — 统一导入声明 -->
+> **关键类型导入**（全模块统一）：
+> ```python
+> from models.types import ChatMessage, ChatCompletionResponse
+> from core.model_client import ModelClient          # async 协议
+> from core.token_budget import TokenBudgetController # 动态 token 预算
+> from core.batch_client import BatchClient           # Batch API 客户端
+> from core.retry_handler import RetryHandler         # 已内置于 ModelClient
+> from exceptions import QwenExhaustedError
+> ```
 
 ---
 
@@ -3017,11 +4282,21 @@ flowchart TD
 class SummaryOrchestrator:
     """摘要生成核心调度器。"""
 
-    def __init__(self, model_client: ModelClient, config: SummaryConfig):
-        self.model_client = model_client
+    # <!-- FIXED: BLOCK-7 — 注入 TokenBudgetController 依赖 -->
+    def __init__(
+        self,
+        model_client: ModelClient,
+        config: SummaryConfig,
+        token_budget_ctrl: TokenBudgetController,
+        use_batch: bool = False,           # <!-- FIXED: 补充 Batch API 集成参数 -->
+    ):
+        self.model_client = model_client   # ModelClient 内部已包含 RetryHandler，摘要模块无需显式调用 <!-- FIXED: 明确 RetryHandler 集成方式 -->
         self.config = config
-        self.short_day_handler = ShortDayHandler(model_client, config)
-        self.long_day_handler = LongDayHandler(model_client, config)
+        self.token_budget_ctrl = token_budget_ctrl
+        self.use_batch = use_batch
+        self.batch_client: BatchClient | None = BatchClient(model_client) if use_batch else None
+        self.short_day_handler = ShortDayHandler(model_client, config, token_budget_ctrl)
+        self.long_day_handler = LongDayHandler(model_client, config, token_budget_ctrl)
         self.degraded_handler = DegradedHandler(model_client, config)
 
     def select_mode(
@@ -3056,14 +4331,64 @@ class SummaryOrchestrator:
         total_tokens = preprocessed.total_token_count
         mode = self.select_mode(total_tokens, model_config.context_limit)
 
-        handler_map = {
-            "short_day": self.short_day_handler,
-            "long_day": self.long_day_handler,
-            "degraded": self.degraded_handler,
-        }
-        handler = handler_map[mode]
-        report = await handler.run(preprocessed, scoring_result, model_config)
-        report.metadata.generation_mode = mode
+        # <!-- FIXED: 补充 Batch API 集成方案 -->
+        if self.use_batch and self.batch_client is not None:
+            return await self.batch_client.submit(
+                mode=mode,
+                preprocessed=preprocessed,
+                scoring_result=scoring_result,
+                model_config=model_config,
+            )
+
+        # <!-- FIXED: BLOCK-11 — 补充 QwenExhaustedError 处理 -->
+        partial_results: list[SessionSummary] = []
+        try:
+            if mode == "short_day":
+                result = await self.short_day_handler.run(
+                    preprocessed, scoring_result, model_config
+                )
+            elif mode == "long_day":
+                result = await self.long_day_handler.run(
+                    preprocessed, scoring_result, model_config,
+                    partial_results=partial_results,   # 收集已完成的时段结果
+                )
+            else:
+                result = await self.degraded_handler.run(
+                    preprocessed, scoring_result, model_config
+                )
+        except QwenExhaustedError as e:
+            # 所有模型（主模型 + 降级模型）均已耗尽，推入人工队列
+            logger.error(f"QwenExhaustedError in mode={mode}: {e}")
+            return self._build_partial_report(partial_results, error=e)
+
+        result.metadata.generation_mode = mode
+        return result
+
+    def _build_partial_report(
+        self,
+        partial_results: list[SessionSummary],
+        error: QwenExhaustedError,
+    ) -> DailyReport:
+        """
+        构建部分结果报告：将已完成的时段摘要合并为不完整日报，
+        标记错误信息，并推入人工审核队列。
+        """
+        report = DailyReport(
+            executive_summary="[自动生成中断] 部分时段摘要已完成，请人工补充。",
+            key_meetings=[],
+            action_items=[],
+        )
+        # 归集已完成时段的内容
+        for session in partial_results:
+            for topic in session.topics:
+                report.key_meetings.append(
+                    KeyMeeting.from_session_topic(session, topic)
+                )
+                report.action_items.extend(topic.action_items)
+        report.metadata.generation_mode = "partial_failure"
+        report.metadata.error_message = str(error)
+        # 推入人工审核队列
+        HumanReviewQueue.enqueue(report, reason="QwenExhaustedError")
         return report
 ```
 
@@ -3183,14 +4508,16 @@ flowchart TD
 class ShortDayHandler:
     """短日模式：单次调用直出全天日报。"""
 
-    TOKEN_BUDGET = {
-        "system_prompt": 2000,
-        "key_people": 500,
-        "conversation": 75000,
-        "instructions": 300,
-        "output_reserved": 32768,
-        "safety_margin": 20000,
-    }
+    # <!-- FIXED: BLOCK-7 — 去掉硬编码 TOKEN_BUDGET，改为通过 TokenBudgetController 动态分配 -->
+    def __init__(
+        self,
+        model_client: ModelClient,
+        config: SummaryConfig,
+        token_budget_ctrl: TokenBudgetController,
+    ):
+        self.model_client = model_client
+        self.config = config
+        self.token_budget_ctrl = token_budget_ctrl
 
     async def run(
         self,
@@ -3198,8 +4525,17 @@ class ShortDayHandler:
         scoring: ScoringResult,
         model_config: ModelConfig,
     ) -> DailyReport:
+        # 动态获取 token 预算分配
+        budget = self.token_budget_ctrl.allocate(
+            total_tokens=preprocessed.total_token_count,
+            mode="short_day",
+        )
+        # budget 返回: {"system_prompt": ..., "key_people": ..., "conversation": ...,
+        #               "instructions": ..., "output_reserved": ..., "safety_margin": ...}
+
+        # <!-- FIXED: BLOCK-6 — 使用 await + list[ChatMessage] 参数类型 -->
         messages = self._build_messages(preprocessed, scoring)
-        response = await self.model_client.chat_completion(
+        response: ChatCompletionResponse = await self.model_client.chat_completion(
             model=model_config.model_name,
             messages=messages,
             enable_thinking=True,
@@ -3207,16 +4543,18 @@ class ShortDayHandler:
         )
         return self._parse_response(response)
 
+    # <!-- FIXED: BLOCK-6 — 返回类型改为 list[ChatMessage]，不再用 dict -->
     def _build_messages(
         self,
         preprocessed: PreprocessedData,
         scoring: ScoringResult,
-    ) -> list[dict]:
+    ) -> list[ChatMessage]:
+        """构建 ChatMessage 列表。从 models/types.py 导入 ChatMessage。"""
         system_content = self._load_system_prompt("short_day_system.txt")
         user_content = self._assemble_user_content(preprocessed, scoring)
         return [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": user_content},
+            ChatMessage(role="system", content=system_content),
+            ChatMessage(role="user", content=user_content),
         ]
 
     def _assemble_user_content(
@@ -3229,6 +4567,11 @@ class ShortDayHandler:
           1. 关键人列表区段
           2. 全量对话文本区段
           3. 生成指令区段
+
+        <!-- FIXED: 明确 scoring 在短日模式的使用方式 -->
+        注意：短日模式下 scoring 不注入 prompt，仅用于后处理阶段：
+        - key_meetings 按 FinalScore 降序排序
+        - 不影响 prompt 内容构建
         """
         parts = [
             self._format_key_people_section(preprocessed.key_people),
@@ -3238,6 +4581,17 @@ class ShortDayHandler:
             self._load_instruction_prompt("short_day_instructions.txt"),
         ]
         return "\n".join(parts)
+```
+
+    # <!-- FIXED: 明确 scoring 在短日模式的后处理使用方式 -->
+    def _parse_response(self, response: ChatCompletionResponse) -> DailyReport:
+        """解析响应并按 FinalScore 排序 key_meetings。"""
+        report = self.parser.parse_daily_report(response)
+        # 后处理：key_meetings 按评分的 FinalScore 降序排序
+        report.key_meetings.sort(
+            key=lambda m: self._get_max_score(m), reverse=True
+        )
+        return report
 ```
 
 **拼接区段详解**
@@ -3251,12 +4605,13 @@ class ShortDayHandler:
 
 ### 7.2.3 思考模式调用参数
 
+<!-- FIXED: BLOCK-6 — messages 在代码中为 list[ChatMessage]，此处展示序列化后的 API 请求体 -->
 ```python
-# 调用参数
+# API 请求体（ChatMessage 序列化后的等效 JSON）
 {
     "model": "qwen3-max",
     "enable_thinking": True,
-    "thinking_budget": 16384,       # 16K tokens 推理空间
+    "thinking_budget": 16384,       # 16K tokens 推理空间（PRD 统一为 16,384） <!-- FIXED: thinking_budget 统一为 16,384 -->
     "messages": [
         {"role": "system", "content": "<系统提示词>"},
         {"role": "user",   "content": "<关键人列表>\n---\n<全量对话文本>\n---\n<生成指令>"},
@@ -3302,19 +4657,36 @@ class ResponseParser:
 
     MAX_RETRIES = 2
 
-    def parse_daily_report(self, raw_response: str) -> DailyReport:
+    # <!-- FIXED: BLOCK-6 — 入参改为 ChatCompletionResponse 对象，从 .content 提取 JSON -->
+    def parse_daily_report(self, response: ChatCompletionResponse) -> DailyReport:
         """
         解析流程：
-          1. 提取 JSON（处理 markdown 代码块包裹等情况）
-          2. 结构校验（必填字段检查）
-          3. 业务校验（交叉一致性）
-          4. 构建 DailyReport 对象
+          1. 从 ChatCompletionResponse.content 提取原始文本
+          2. 提取 JSON（处理 markdown 代码块包裹等情况）
+          3. 结构校验（必填字段检查）
+          4. 业务校验（交叉一致性）
+          5. 构建 DailyReport 对象
         """
-        json_str = self._extract_json(raw_response)
+        raw_text = response.content      # 从响应对象提取文本
+        json_str = self._extract_json(raw_text)
         data = json.loads(json_str)
         self._validate_structure(data)
         self._validate_business_rules(data)
         return DailyReport.from_dict(data)
+
+    def parse_session_summary(self, response: ChatCompletionResponse) -> SessionSummary:
+        """解析时段摘要响应。"""
+        raw_text = response.content
+        json_str = self._extract_json(raw_text)
+        data = json.loads(json_str)
+        return SessionSummary.from_dict(data)
+
+    def parse_chunk_summary(self, response: ChatCompletionResponse) -> ChunkSummary:
+        """解析片段摘要响应。"""
+        raw_text = response.content
+        json_str = self._extract_json(raw_text)
+        data = json.loads(json_str)
+        return ChunkSummary.from_dict(data)
 
     def _extract_json(self, raw: str) -> str:
         """处理 LLM 输出可能的包裹格式（```json ... ```）。"""
@@ -3471,27 +4843,67 @@ class SessionSplitter:
 class LongDayHandler:
     """长日模式：两级弹性摘要。"""
 
+    def __init__(
+        self,
+        model_client: ModelClient,
+        config: SummaryConfig,
+        token_budget_ctrl: TokenBudgetController,
+    ):
+        self.model_client = model_client
+        self.config = config
+        self.token_budget_ctrl = token_budget_ctrl
+        self.splitter = SessionSplitter()
+        self.parser = ResponseParser()
+        self.deduplicator = Deduplicator()
+
     async def run(
         self,
         preprocessed: PreprocessedData,
         scoring: ScoringResult,
         model_config: ModelConfig,
+        partial_results: list[SessionSummary] | None = None,
     ) -> DailyReport:
         # 第一步：分片
         sessions = self.splitter.split(preprocessed)
 
-        # 第二步：并行生成时段摘要
-        session_summaries = await asyncio.gather(
-            *[
-                self._generate_session_summary(session, scoring, model_config)
-                for session in sessions
-            ]
+        # <!-- FIXED: BLOCK-7 — 通过 TokenBudgetController 获取动态预算 -->
+        budget = self.token_budget_ctrl.allocate(
+            total_tokens=preprocessed.total_token_count,
+            mode="long_day",
         )
+
+        # <!-- FIXED: BLOCK-11 — 单个时段摘要失败时跳过该时段并标记，不中断整个流程 -->
+        # 第二步：逐时段生成摘要，单个失败不中断
+        session_summaries: list[SessionSummary] = []
+        skipped_sessions: list[dict] = []
+        for session in sessions:
+            try:
+                summary = await self._generate_session_summary(
+                    session, scoring, model_config
+                )
+                session_summaries.append(summary)
+                if partial_results is not None:
+                    partial_results.append(summary)  # 供外层异常处理收集
+            except QwenExhaustedError as e:
+                logger.warning(
+                    f"时段 {session.session_id} 摘要生成失败，跳过: {e}"
+                )
+                skipped_sessions.append({
+                    "session_id": session.session_id,
+                    "error": str(e),
+                })
+                continue
+
+        if not session_summaries:
+            raise QwenExhaustedError("所有时段摘要均失败")
 
         # 第三步：合并生成全天日报
         report = await self._merge_to_daily_report(
             session_summaries, scoring, model_config
         )
+        # 标记跳过的时段
+        if skipped_sessions:
+            report.metadata.skipped_sessions = skipped_sessions
         return report
 
     async def _generate_session_summary(
@@ -3500,8 +4912,10 @@ class LongDayHandler:
         scoring: ScoringResult,
         model_config: ModelConfig,
     ) -> SessionSummary:
-        messages = self._build_session_messages(session, scoring)
-        response = await self.model_client.chat_completion(
+        # <!-- FIXED: BLOCK-6 — messages 使用 list[ChatMessage] -->
+        messages: list[ChatMessage] = self._build_session_messages(session, scoring)
+        # <!-- FIXED: BLOCK-6 — await async chat_completion，返回 ChatCompletionResponse -->
+        response: ChatCompletionResponse = await self.model_client.chat_completion(
             model=model_config.model_name,
             messages=messages,
             enable_thinking=True,
@@ -3592,11 +5006,13 @@ class LongDayHandler:
         all_critical_facts = self._collect_critical_facts(session_summaries)
 
         # 构建合并 prompt
-        messages = self._build_merge_messages(
+        # <!-- FIXED: BLOCK-6 — messages 使用 list[ChatMessage] -->
+        messages: list[ChatMessage] = self._build_merge_messages(
             session_summaries, topic_map, all_critical_facts
         )
 
-        response = await self.model_client.chat_completion(
+        # <!-- FIXED: BLOCK-6 — await async chat_completion，返回 ChatCompletionResponse -->
+        response: ChatCompletionResponse = await self.model_client.chat_completion(
             model=model_config.model_name,
             messages=messages,
             enable_thinking=True,
@@ -3610,6 +5026,9 @@ class LongDayHandler:
 
         return report
 ```
+
+<!-- FIXED: 明确长日模式中 scoring 的消费方式 -->
+> **长日模式 scoring 使用方式**：scoring 结果用于时段内内容排序（高分片段优先出现在 prompt 中）和 key_meetings 优先级排定（按 FinalScore 降序）。不用于内容裁剪。
 
 #### topic_id 跨时段关联实现
 
@@ -3812,8 +5231,9 @@ class DegradedHandler:
         model_config: ModelConfig,
     ) -> ChunkSummary:
         """片段级摘要。不启用思考模式（小模型不支持或效果不佳）。"""
-        messages = self._build_chunk_messages(chunk)
-        response = await self.model_client.chat_completion(
+        # <!-- FIXED: BLOCK-6 — messages 使用 list[ChatMessage]，response 为 ChatCompletionResponse -->
+        messages: list[ChatMessage] = self._build_chunk_messages(chunk)
+        response: ChatCompletionResponse = await self.model_client.chat_completion(
             model=model_config.model_name,
             messages=messages,
             enable_thinking=False,
@@ -3826,8 +5246,8 @@ class DegradedHandler:
         model_config: ModelConfig,
     ) -> SessionSummary:
         """将同一时段的片段摘要合并为时段摘要（同 5.2.2 格式）。"""
-        messages = self._build_session_merge_messages(chunk_summaries)
-        response = await self.model_client.chat_completion(
+        messages: list[ChatMessage] = self._build_session_merge_messages(chunk_summaries)
+        response: ChatCompletionResponse = await self.model_client.chat_completion(
             model=model_config.model_name,
             messages=messages,
             enable_thinking=False,
@@ -3840,8 +5260,8 @@ class DegradedHandler:
         model_config: ModelConfig,
     ) -> DailyReport:
         """将各时段摘要合并为全天日报（同 5.4 格式）。"""
-        messages = self._build_daily_merge_messages(session_summaries)
-        response = await self.model_client.chat_completion(
+        messages: list[ChatMessage] = self._build_daily_merge_messages(session_summaries)
+        response: ChatCompletionResponse = await self.model_client.chat_completion(
             model=model_config.model_name,
             messages=messages,
             enable_thinking=False,
@@ -4095,12 +5515,14 @@ class CriticalFact:
 @dataclass
 class ReportMetadata:
     """日报元数据。"""
-    generation_mode: str = ""               # "short_day" / "long_day" / "degraded"
+    generation_mode: str = ""               # "short_day" / "long_day" / "degraded" / "partial_failure"
     report_date: str = ""                   # "2026-03-27"
     total_tokens_processed: int = 0
     api_calls_count: int = 0
     generation_time_seconds: float = 0.0
     model_name: str = ""
+    error_message: str | None = None        # <!-- FIXED: BLOCK-11 — 记录 QwenExhaustedError 信息 -->
+    skipped_sessions: list[dict] | None = None  # <!-- FIXED: BLOCK-11 — 记录跳过的时段 -->
 ```
 
 ### 7.5.3 三级阅读体验生成方法
@@ -4379,6 +5801,9 @@ class PromptTemplate:
 | 分片 | 无 | 2-3 个时段 | 多片段 -> 时段 -> 全天 |
 | 去重 | 模型内部完成 | 语义相似度 + 实体校验 | 同长日模式 |
 | topic_id | 模型单次内部分配 | 时段分配 + 跨时段关联 | 片段分配 + 逐级传递 |
+| scoring 使用 | 不注入 prompt，仅后处理排序 <!-- FIXED: 明确 scoring 使用 --> | 时段内容排序 + key_meetings 优先级 | 同长日模式 |
+| Token 预算 | `TokenBudgetController.allocate(mode="short_day")` <!-- FIXED: BLOCK-7 --> | `TokenBudgetController.allocate(mode="long_day")` | 固定值（降级模型 context 有限） |
+| 错误处理 | 捕获 QwenExhaustedError → 人工队列 <!-- FIXED: BLOCK-11 --> | 单时段失败跳过并标记 | 捕获 QwenExhaustedError → 人工队列 |
 | 输出格式 | DailyReport | DailyReport | DailyReport |
 
 ## 附录 B：关键配置参数汇总
@@ -4395,6 +5820,59 @@ class PromptTemplate:
 | `entity_overlap_threshold` | 0.80 | `Deduplicator` | 实体重合率阈值 |
 | `chunk_token_limit` | 8,000 | `DegradedHandler` | 降级模式单片段上限 |
 | `max_parse_retries` | 2 | `ResponseParser` | JSON 解析重试次数 |
+| `use_batch` | `false` | `SummaryOrchestrator` | 是否通过 Batch API 提交 <!-- FIXED: 补充 Batch API 参数 --> |
+
+---
+
+<!-- FIXED: 补充 Batch API 集成方案 -->
+## 附录 C：Batch API 集成方案
+
+`SummaryOrchestrator` 构造函数新增 `use_batch: bool` 参数（默认 `False`）。当 `use_batch=True` 时：
+
+1. 不走实时 `chat_completion` 路径，改为通过 `BatchClient.submit()` 提交异步批量任务
+2. `BatchClient` 封装 Qwen Batch API，将 messages 序列化为 JSONL 并提交
+3. 返回值为 `DailyReport`（异步轮询获取结果后解析）
+4. 适用于非实时场景（如夜间批量生成历史日报）
+
+```python
+class BatchClient:
+    """Batch API 客户端，封装异步批量提交。"""
+
+    def __init__(self, model_client: ModelClient):
+        self.model_client = model_client
+
+    async def submit(
+        self,
+        mode: str,
+        preprocessed: PreprocessedData,
+        scoring_result: ScoringResult,
+        model_config: ModelConfig,
+    ) -> DailyReport:
+        """提交批量任务并异步等待结果。"""
+        # 1. 根据 mode 构建完整 messages
+        # 2. 序列化为 JSONL 格式
+        # 3. 调用 Batch API 提交
+        # 4. 轮询等待完成
+        # 5. 解析结果并返回 DailyReport
+        ...
+```
+
+---
+
+<!-- FIXED: 明确 RetryHandler 集成方式 -->
+## 附录 D：RetryHandler 集成说明
+
+`ModelClient` 内部已集成 `RetryHandler`，摘要模块 **无需显式调用** 重试逻辑。具体行为：
+
+| 层级 | 重试职责 | 说明 |
+|:---|:---|:---|
+| `ModelClient` | 网络级重试 | 连接超时、429 限流、500 服务端错误，按指数退避重试 |
+| `ModelClient` | 模型降级 | 主模型失败后自动切换降级模型（如 qwen3-max -> qwen3-plus） |
+| `ModelClient` | 异常上抛 | 所有模型均失败时抛出 `QwenExhaustedError` |
+| `SummaryOrchestrator` | 业务级处理 | 捕获 `QwenExhaustedError`，构建部分结果并推入人工队列 |
+| `ResponseParser` | 解析级重试 | JSON 解析失败时重试（`MAX_RETRIES=2`），属于摘要模块内部逻辑 |
+
+摘要模块只需关注 `QwenExhaustedError` 的捕获处理，不应绕过或重复 `ModelClient` 的重试机制。
 
 
 ---
@@ -4415,8 +5893,21 @@ class PromptTemplate:
 
 ```python
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Protocol
 from enum import Enum
+
+
+<!-- FIXED: BLOCK-6 — 增加 ModelClient Protocol 定义 -->
+class ModelClient(Protocol):
+    """模型客户端协议——摘要模块依赖此抽象，不直接依赖 QwenClient"""
+    async def chat_completion(
+        self, messages: list["ChatMessage"], *,
+        model: Optional[str] = None,
+        enable_thinking: bool = False,
+        thinking_budget: Optional[int] = None,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+    ) -> "ChatCompletionResponse": ...
 
 
 class ThinkingMode(Enum):
@@ -4453,11 +5944,11 @@ class ChatCompletionResponse:
 class QwenClientConfig:
     """由 config/model_params.yaml 加载，运行时不可变"""
     api_base: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    model: str = "qwen3-max"                 # 生产环境应锁定快照版本
-    fallback_model: str = "qwen-plus"
+    model: str = "qwen3-max-2026-01-23"      # <!-- FIXED: BLOCK-8 --> 默认锁定快照版本
+    fallback_model: str = "qwen3-plus"       # <!-- FIXED: BLOCK-8 --> 对齐 PRD 2.4.2
     api_key_env: str = "QWEN_API_KEY"        # 从环境变量读取，不硬编码
-    default_temperature: float = 0.7
-    default_max_tokens: int = 8000
+    default_temperature: float = 0.3         # <!-- FIXED: 对齐配置模块场景默认值 -->
+    default_max_tokens: int = 32_768         # <!-- FIXED: BLOCK-7 --> 对齐思考模式最大输出
     timeout_normal: int = 30                 # 秒，普通请求
     timeout_large: int = 120                 # 秒，大窗口请求（>100K tokens）
     large_window_threshold: int = 100_000    # 输入 tokens 超过此值使用大超时
@@ -4475,7 +5966,8 @@ class QwenClient:
         """
         ...
 
-    def chat_completion(
+    <!-- FIXED: BLOCK-6 — chat_completion 改为 async def -->
+    async def chat_completion(
         self,
         messages: list[ChatMessage],
         *,
@@ -4576,13 +6068,13 @@ sequenceDiagram
 | 参数 | 来源 | 默认值 | 说明 |
 |:---|:---|:---|:---|
 | `api_base` | `config/model_params.yaml` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | OpenAI 兼容端点 |
-| `model` | `config/model_params.yaml` | `qwen3-max`（生产应锁快照版本） | 模型标识 |
+| `model` | `config/model_params.yaml` | `qwen3-max-2026-01-23`（快照版本） | 模型标识 <!-- FIXED: BLOCK-8 --> |
 | `api_key` | 环境变量 `QWEN_API_KEY` | — | **禁止硬编码** |
 | `timeout_normal` | `config/model_params.yaml` | 30s | 普通请求超时 |
 | `timeout_large` | `config/model_params.yaml` | 120s | 大窗口请求超时 |
 | `large_window_threshold` | `config/model_params.yaml` | 100,000 tokens | 切换至大超时的阈值 |
-| `default_temperature` | `config/model_params.yaml` | 0.7 | 默认采样温度 |
-| `default_max_tokens` | `config/model_params.yaml` | 8,000 | 默认最大输出 tokens |
+| `default_temperature` | `config/model_params.yaml` | 0.3 | 默认采样温度 <!-- FIXED: 对齐配置模块 --> |
+| `default_max_tokens` | `config/model_params.yaml` | 32,768 | 默认最大输出 tokens <!-- FIXED: BLOCK-7 --> |
 
 ### 8.5 错误处理矩阵
 
@@ -4819,15 +6311,16 @@ import time
 T = TypeVar("T")
 
 
+<!-- FIXED: BLOCK-8 — 统一 retry 字段名为 backoff_base / backoff_multiplier / max_retries / max_delay -->
 @dataclass
 class RetryConfig:
     """重试策略配置"""
     max_retries: int = 3
-    base_delay: float = 1.0              # 初始退避（秒）
-    max_delay: float = 8.0               # 最大退避（秒）
-    backoff_factor: float = 2.0          # 退避乘数：1s → 2s → 4s → 8s
+    backoff_base: float = 1.0            # 初始退避（秒）
+    max_delay: float = 8.0              # 最大退避（秒）
+    backoff_multiplier: float = 2.0      # 退避乘数：1s → 2s → 4s → 8s
     retryable_status_codes: tuple = (429, 500, 502, 503)
-    fallback_model: str = "qwen-plus"    # 3 次失败后降级模型
+    fallback_model: str = "qwen3-plus"   # <!-- FIXED: BLOCK-8 --> 降级模型对齐 PRD 2.4.2
 
 
 @dataclass
@@ -4912,7 +6405,7 @@ class RetryHandler:
     def _calculate_delay(self, attempt: int) -> float:
         """
         计算第 attempt 次重试的等待时间：
-        delay = min(base_delay * (backoff_factor ** attempt), max_delay)
+        delay = min(backoff_base * (backoff_multiplier ** attempt), max_delay)
         即：1s, 2s, 4s, 8s
         """
         ...
@@ -4958,10 +6451,10 @@ sequenceDiagram
     end
 
     Note over RH: 3 次重试均失败，触发降级
-    RH->>FQC: chat_completion(messages, model=qwen-plus)
+    RH->>FQC: chat_completion(messages, model=qwen3-plus)
     alt 降级成功
         FQC-->>RH: ChatCompletionResponse
-        RH->>CT: record(usage, model=qwen-plus, is_fallback=True)
+        RH->>CT: record(usage, model=qwen3-plus, is_fallback=True)
         RH-->>Caller: ChatCompletionResponse
     else 降级也失败
         FQC-->>RH: Error
@@ -4974,21 +6467,21 @@ sequenceDiagram
 | 参数 | 来源 | 默认值 | 说明 |
 |:---|:---|:---|:---|
 | `max_retries` | `config/model_params.yaml` | 3 | 最大重试次数 |
-| `base_delay` | `config/model_params.yaml` | 1.0s | 首次退避延迟 |
+| `backoff_base` | `config/model_params.yaml` | 1.0s | 首次退避延迟 <!-- FIXED: BLOCK-8 --> |
 | `max_delay` | `config/model_params.yaml` | 8.0s | 退避上限 |
-| `backoff_factor` | `config/model_params.yaml` | 2.0 | 指数退避乘数 |
-| `fallback_model` | `config/model_params.yaml` | `qwen-plus` | 降级模型 |
+| `backoff_multiplier` | `config/model_params.yaml` | 2.0 | 指数退避乘数 <!-- FIXED: BLOCK-8 --> |
+| `fallback_model` | `config/model_params.yaml` | `qwen3-plus` | 降级模型 <!-- FIXED: BLOCK-8 --> |
 | `daily_cost_limit` | `config/model_params.yaml` | 10.0 (元) | 日预算告警阈值 |
 
 ### 10.5 错误处理矩阵
 
 | 错误类型 | HTTP 状态码 | 可重试 | 重试策略 | 最终降级 |
 |:---|:---|:---|:---|:---|
-| Rate Limit | 429 | 是 | 指数退避 1→2→4→8s | 切换 qwen-plus |
-| Server Error | 500 | 是 | 指数退避 | 切换 qwen-plus |
-| Bad Gateway | 502 | 是 | 指数退避 | 切换 qwen-plus |
-| Service Unavailable | 503 | 是 | 指数退避 | 切换 qwen-plus |
-| 请求超时 | — | 是 | 指数退避 | 切换 qwen-plus |
+| Rate Limit | 429 | 是 | 指数退避 1→2→4→8s | 切换 qwen3-plus |
+| Server Error | 500 | 是 | 指数退避 | 切换 qwen3-plus |
+| Bad Gateway | 502 | 是 | 指数退避 | 切换 qwen3-plus |
+| Service Unavailable | 503 | 是 | 指数退避 | 切换 qwen3-plus |
+| 请求超时 | — | 是 | 指数退避 | 切换 qwen3-plus |
 | Bad Request | 400 | **否** | 立即终止 | 抛出异常，不降级 |
 | Unauthorized | 401 | **否** | 立即终止 | 抛出异常，告警通知 |
 | 降级模型也失败 | any | **否** | — | 抛出 `QwenExhaustedError`，进入人工队列 |
@@ -5054,6 +6547,7 @@ class ChunkPlan:
     overflow_tokens: int            # 触发分片的溢出量
 
 
+<!-- FIXED: BLOCK-7 — 修正 Token 预算参数，对齐 PRD ≥20,000 安全余量 & 思考模式最大输出 32,768 -->
 @dataclass
 class TokenBudgetConfig:
     model_context_limit: int = 262_144
@@ -5062,11 +6556,11 @@ class TokenBudgetConfig:
     key_people_tokens: int = 500                 # 关键人配置注入上限
     output_tokens_segment: int = 4_000           # 片段级输出预留
     output_tokens_session: int = 6_000           # 时段级输出预留
-    output_tokens_daily: int = 8_000             # 全天级输出预留
+    output_tokens_daily: int = 32_768            # 全天级输出预留（对齐思考模式最大输出）
     thinking_budget_default: int = 16_384        # 思考模式默认预算
     compact_prompt_threshold: int = 190_000      # 内容载荷超此值切换精简提示词
     chunking_trigger_threshold: int = 200_000    # 超此值触发分片
-    safety_margin_tokens: int = 2_000            # 安全余量
+    safety_margin_tokens: int = 20_000           # 安全余量（对齐 PRD ≥20,000）
 
 
 class TokenBudgetController:
@@ -5138,8 +6632,9 @@ class TokenBudgetController:
         thinking_budget: Optional[int] = None,
     ) -> int:
         """
+        <!-- FIXED: BLOCK-7 — 按场景区分输出预留 -->
         计算输出预留 tokens：
-        - 基础预留：segment=4K, session=6K, daily=8K
+        - 基础预留：segment=4,000 / session=6,000 / daily=32,768
         - 思考模式：额外加 thinking_budget（默认 16,384）
         """
         ...
@@ -5159,9 +6654,9 @@ sequenceDiagram
     QC-->>TBC: content_tokens = 95,000
 
     TBC->>TBC: select_prompt_version(95,000) → FULL
-    TBC->>TBC: get_output_reserve("daily", True, 16384) → 24,384
-    TBC->>TBC: total = 1,500 + 500 + 95,000 + 24,384 = 121,384
-    TBC->>TBC: 121,384 ≤ 262,144 → within_budget = True
+    TBC->>TBC: get_output_reserve("daily", True, 16384) → 49,152
+    TBC->>TBC: total = 1,500 + 500 + 95,000 + 49,152 + 20,000 = 166,152
+    TBC->>TBC: 166,152 ≤ 262,144 → within_budget = True
 
     TBC-->>Orch: (BudgetAllocation(within_budget=True), None)
     Note over Orch: 无需分片，直接单次调用
@@ -5172,7 +6667,7 @@ sequenceDiagram
         TBC->>QC: count_tokens(huge_text)
         QC-->>TBC: content_tokens = 220,000
         TBC->>TBC: select_prompt_version(220,000) → COMPACT
-        TBC->>TBC: total = 800 + 500 + 220,000 + 24,384 = 245,684
+        TBC->>TBC: total = 800 + 500 + 220,000 + 49,152 + 20,000 = 290,452
         TBC->>TBC: content > chunking_trigger_threshold(200K) → 需要分片
         TBC->>TBC: plan_chunks(overflow=20,000, total=220,000)
         TBC-->>Orch: (BudgetAllocation(within_budget=False), ChunkPlan(num_chunks=2, target=180,000))
@@ -5188,13 +6683,13 @@ sequenceDiagram
 | `system_prompt_full_tokens` | `config/model_params.yaml` | 1,500 | 完整提示词预估 token 数 |
 | `system_prompt_compact_tokens` | `config/model_params.yaml` | 800 | 精简提示词预估 token 数 |
 | `key_people_tokens` | `config/model_params.yaml` | 500 | 关键人注入上限 |
-| `output_tokens_segment` | `config/model_params.yaml` | 4,000 | 片段级输出预留 |
-| `output_tokens_session` | `config/model_params.yaml` | 6,000 | 时段级输出预留 |
-| `output_tokens_daily` | `config/model_params.yaml` | 8,000 | 全天级输出预留 |
+| `output_tokens_segment` | `config/model_params.yaml` | 4,000 | 片段级输出预留 <!-- FIXED: BLOCK-7 --> |
+| `output_tokens_session` | `config/model_params.yaml` | 6,000 | 时段级输出预留 <!-- FIXED: BLOCK-7 --> |
+| `output_tokens_daily` | `config/model_params.yaml` | 32,768 | 全天级输出预留（对齐思考模式最大输出）<!-- FIXED: BLOCK-7 --> |
 | `thinking_budget_default` | `config/model_params.yaml` | 16,384 | 默认思维链预算 |
 | `compact_prompt_threshold` | `config/model_params.yaml` | 190,000 | 切换精简提示词的内容阈值 |
 | `chunking_trigger_threshold` | `config/model_params.yaml` | 200,000 | 触发分片的内容阈值 |
-| `safety_margin_tokens` | `config/model_params.yaml` | 2,000 | 安全余量 |
+| `safety_margin_tokens` | `config/model_params.yaml` | 20,000 | 安全余量（对齐 PRD ≥20,000）<!-- FIXED: BLOCK-7 --> |
 
 ### 11.5 错误处理矩阵
 
@@ -5249,16 +6744,20 @@ class TokenBudgetExceededError(QwenBaseError):
 
 ---
 
-## 附录：`config/model_params.yaml` 完整参考
+<!-- FIXED: BLOCK-8 — 附录 YAML 改为引用配置模块的统一定义，此处仅保留 API 层视角的快速参考 -->
+## 附录：`config/model_params.yaml` 快速参考
+
+> **权威定义**位于配置模块（模块 12）的 `ModelParamsConfig` Pydantic 模型。以下为 API 层消费的关键字段摘要，完整 Schema 以配置模块为准。
 
 ```yaml
-# Qwen3-Max 模型配置
+# config/model_params.yaml — 统一 Schema（权威定义见配置模块 12.6）
 model:
-  name: "qwen3-max"                      # 开发环境；生产必须锁快照版本
-  snapshot: "qwen3-max-2026-01-23"        # 生产版本
-  fallback: "qwen-plus"                   # 降级模型
+  name: "qwen3-max-2026-01-23"            # 快照版本（统一使用单一 name 字段）
+  fallback: "qwen3-plus"                   # 降级模型（对齐 PRD 2.4.2）
   api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
-  api_key_env: "QWEN_API_KEY"             # 环境变量名
+  api_key_env: "QWEN_API_KEY"
+  thinking_budget_default: 16384
+  batch_api_enabled: true
 
 # 超时配置
 timeout:
@@ -5266,26 +6765,26 @@ timeout:
   large_window: 120                       # 秒
   large_window_threshold: 100000          # tokens
 
-# 默认推理参数
-inference:
-  temperature: 0.7
-  max_tokens: 8000
-  thinking_budget_default: 16384
-
-# 重试策略
-retry:
-  max_retries: 3
-  base_delay: 1.0
-  max_delay: 8.0
-  backoff_factor: 2.0
-  retryable_status_codes: [429, 500, 502, 503]
-
-# Batch API
-batch:
-  enabled: true
-  poll_interval: 30                       # 秒
-  poll_timeout: 3600                      # 秒
-  max_tasks_per_batch: 100
+# 各场景调用参数
+calls:
+  segment_summary:
+    max_tokens: 4000
+    enable_thinking: false
+    temperature: 0.3
+  period_summary:
+    max_tokens: 6000
+    enable_thinking: false
+    temperature: 0.3
+  daily_report:
+    max_tokens: 32768                     # 对齐思考模式最大输出
+    enable_thinking: true
+    thinking_budget: 16384
+    temperature: 0.3
+  importance_eval:
+    max_tokens: 64
+    enable_thinking: false
+    temperature: 0
+    batch_size: 10
 
 # Token 预算
 token_budget:
@@ -5296,16 +6795,35 @@ token_budget:
   output_tokens:
     segment: 4000
     session: 6000
-    daily: 8000
+    daily: 32768                          # 对齐思考模式最大输出
   compact_prompt_threshold: 190000
   chunking_trigger_threshold: 200000
-  safety_margin: 2000
+  safety_margin: 20000                    # 对齐 PRD ≥20,000
+  short_day_threshold: 80000
+  long_day_max: 250000
+  system_prompt_budget: 2000
+  key_people_inject_budget: 600
+
+# 重试策略（统一字段名）
+retry:
+  max_retries: 3
+  backoff_base: 1.0
+  backoff_multiplier: 2.0
+  max_delay: 8.0
+  retryable_status_codes: [429, 500, 502, 503]
+
+# Batch API
+batch:
+  enabled: true
+  poll_interval: 30
+  poll_timeout: 3600
+  max_tasks_per_batch: 100
 
 # 成本监控
 cost:
   daily_limit_yuan: 10.0
   monthly_limit_yuan: 200.0
-  alert_threshold_pct: 80                 # 达到 80% 预算时告警
+  alert_threshold_pct: 80
 ```
 
 
@@ -5362,6 +6880,7 @@ class ConfigSnapshot:
     asr_corrections: "ASRCorrectionsConfig"
     time_periods: "TimePeriodConfig"
     model_params: "ModelParamsConfig"
+    chunking_strategy: "ChunkingStrategyConfig"  # <!-- FIXED: 增加 chunking_strategy.yaml 加载 -->
     loaded_at: datetime = field(default_factory=datetime.now)
     version_hash: str = ""  # 配置内容的 MD5，用于变更检测
 
@@ -5430,28 +6949,32 @@ class ConfigManager:
 
     # ── 内部构建逻辑 ──────────────────────────────────────
     def _build_snapshot(self) -> ConfigSnapshot:
+        <!-- FIXED: 增加 chunking_strategy.yaml 的加载 -->
         """读取所有 YAML -> Pydantic 校验 -> 构建不可变快照"""
         raw_kp = self._load_yaml("key_people.yaml")
         raw_asr = self._load_yaml("asr_name_corrections.yaml")
         raw_tp = self._load_yaml("time_period_config.yaml")
         raw_mp = self._load_yaml("model_params.yaml")
+        raw_cs = self._load_yaml("chunking_strategy.yaml")
 
         # Pydantic 校验（校验失败自动抛出 ValidationError）
         kp_config = KeyPeopleConfig(**raw_kp)
         asr_config = ASRCorrectionsConfig(**raw_asr)
         tp_config = TimePeriodConfig(**raw_tp)
         mp_config = ModelParamsConfig(**raw_mp)
+        cs_config = ChunkingStrategyConfig(**raw_cs)
 
         # 构建查找索引（预计算，提升匹配性能）
         kp_config.build_lookup_indices()
 
-        version_hash = self._compute_hash(raw_kp, raw_asr, raw_tp, raw_mp)
+        version_hash = self._compute_hash(raw_kp, raw_asr, raw_tp, raw_mp, raw_cs)
 
         return ConfigSnapshot(
             key_people=kp_config,
             asr_corrections=asr_config,
             time_periods=tp_config,
             model_params=mp_config,
+            chunking_strategy=cs_config,
             version_hash=version_hash,
         )
 
@@ -5762,13 +7285,22 @@ class TimePeriodConfig(BaseModel):
 
 #### 12.6.1 YAML 文件结构
 
+<!-- FIXED: BLOCK-8 — 合并为统一 Schema，补充 timeout / cost 区块；BLOCK-7 — daily_report max_tokens 对齐 32768；thinking_budget_default 统一为 16384 -->
 ```yaml
-# config/model_params.yaml
+# config/model_params.yaml — 统一权威定义
 model:
-  name: "qwen3-max-2026-01-23"       # 快照版本，禁止使用 qwen3-max
-  fallback: "qwen3-plus"              # 降级模型
-  thinking_budget_default: 16000
+  name: "qwen3-max-2026-01-23"       # 快照版本（统一单一 name 字段）
+  fallback: "qwen3-plus"              # 降级模型（对齐 PRD 2.4.2）
+  api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  api_key_env: "QWEN_API_KEY"
+  thinking_budget_default: 16384      # 统一为 16,384
   batch_api_enabled: true
+
+# 超时配置
+timeout:
+  normal: 30                          # 秒，普通请求
+  large_window: 120                   # 秒，大窗口请求（>100K tokens）
+  large_window_threshold: 100000      # tokens
 
 calls:
   segment_summary:
@@ -5780,7 +7312,7 @@ calls:
     enable_thinking: false
     temperature: 0.3
   daily_report:
-    max_tokens: 8000
+    max_tokens: 32768                 # 对齐思考模式最大输出
     enable_thinking: true
     thinking_budget: 16384
     temperature: 0.3
@@ -5788,7 +7320,7 @@ calls:
     max_tokens: 64
     enable_thinking: false
     temperature: 0
-    batch_size: 10              # 每批评估片段数
+    batch_size: 10
 
 token_budget:
   short_day_threshold: 80000     # 短日模式上限（tokens）
@@ -5799,8 +7331,21 @@ token_budget:
 
 retry:
   max_retries: 3
-  backoff_base: 1                # 指数退避基数（秒）
-  backoff_multiplier: 2          # 1s → 2s → 4s → 8s
+  backoff_base: 1.0              # 指数退避基数（秒）
+  backoff_multiplier: 2.0        # 1s → 2s → 4s → 8s
+  max_delay: 8.0                 # <!-- FIXED: BLOCK-8 --> 最大退避（秒）
+  retryable_status_codes: [429, 500, 502, 503]
+
+# <!-- FIXED: BLOCK-8 — 增加 timeout 和 cost 配置区块 -->
+timeout:
+  normal: 30                     # 秒，普通请求
+  large_window: 120              # 秒，大窗口请求（>100K tokens）
+  large_window_threshold: 100000 # tokens
+
+cost:
+  daily_limit_yuan: 10.0
+  monthly_limit_yuan: 200.0
+  alert_threshold_pct: 80
 ```
 
 #### 12.6.2 Pydantic 模型
@@ -5815,10 +7360,13 @@ class CallParams(BaseModel):
     batch_size: int = Field(default=1, ge=1, description="批量调用时每批片段数")
 
 
+<!-- FIXED: BLOCK-8 — thinking_budget_default 统一为 16384；模型名统一为 qwen3-max-2026-01-23；降级模型统一为 qwen3-plus -->
 class ModelSpec(BaseModel):
-    name: str = Field(..., description="模型快照版本")
-    fallback: str = Field(default="qwen3-plus", description="降级模型")
-    thinking_budget_default: int = Field(default=16000, ge=0)
+    name: str = Field(default="qwen3-max-2026-01-23", description="模型快照版本")
+    fallback: str = Field(default="qwen3-plus", description="降级模型（对齐 PRD 2.4.2）")
+    api_base: str = Field(default="https://dashscope.aliyuncs.com/compatible-mode/v1")
+    api_key_env: str = Field(default="QWEN_API_KEY", description="API Key 环境变量名")
+    thinking_budget_default: int = Field(default=16384, ge=0)
     batch_api_enabled: bool = True
 
 
@@ -5830,10 +7378,28 @@ class TokenBudget(BaseModel):
     safety_margin: int = 20000
 
 
+<!-- FIXED: BLOCK-8 — retry 字段统一为 backoff_base/backoff_multiplier/max_retries/max_delay -->
 class RetryConfig(BaseModel):
     max_retries: int = Field(default=3, ge=0)
     backoff_base: float = Field(default=1.0, ge=0)
     backoff_multiplier: float = Field(default=2.0, ge=1.0)
+    max_delay: float = Field(default=8.0, ge=0, description="最大退避（秒）")
+    retryable_status_codes: list[int] = Field(default=[429, 500, 502, 503])
+
+
+<!-- FIXED: BLOCK-8 — 配置模块增加 timeout 和 cost Pydantic 模型 -->
+class TimeoutConfig(BaseModel):
+    """超时配置"""
+    normal: int = Field(default=30, ge=1, description="普通请求超时（秒）")
+    large_window: int = Field(default=120, ge=1, description="大窗口请求超时（秒）")
+    large_window_threshold: int = Field(default=100000, ge=1, description="切换大超时的输入 token 阈值")
+
+
+class CostConfig(BaseModel):
+    """成本监控配置"""
+    daily_limit_yuan: float = Field(default=10.0, ge=0, description="日预算上限（元）")
+    monthly_limit_yuan: float = Field(default=200.0, ge=0, description="月预算上限（元）")
+    alert_threshold_pct: int = Field(default=80, ge=0, le=100, description="预算告警阈值百分比")
 
 
 class ModelParamsConfig(BaseModel):
@@ -5844,6 +7410,8 @@ class ModelParamsConfig(BaseModel):
     )
     token_budget: TokenBudget = Field(default_factory=TokenBudget)
     retry: RetryConfig = Field(default_factory=RetryConfig)
+    timeout: TimeoutConfig = Field(default_factory=TimeoutConfig)   # <!-- FIXED: BLOCK-8 — 增加 timeout 配置 -->
+    cost: CostConfig = Field(default_factory=CostConfig)           # <!-- FIXED: BLOCK-8 — 增加 cost 配置 -->
 
     def get_call_params(self, scenario: str) -> CallParams:
         if scenario not in self.calls:
@@ -5862,7 +7430,7 @@ sequenceDiagram
 
     Note over App: === 启动阶段 ===
     App->>CM: load_all()
-    CM->>FS: 读取 4 个 YAML 文件
+    CM->>FS: 读取 5 个 YAML 文件
     FS-->>CM: raw dict
     CM->>PD: 校验 KeyPeopleConfig / ASRCorrectionsConfig / ...
     alt 校验通过
@@ -5903,7 +7471,7 @@ flowchart TD
     L15{"L1.5: ASR 人名<br/>纠错查找"}
     L2{"L2: 姓名/别名<br/>模糊匹配"}
     L3{"L3: 内容推断<br/>LLM 辅助"}
-    MISS["未匹配:<br/>标记为 unknown"]
+    MISS["未匹配:<br/>标记为 NONE"]
 
     INPUT --> L1
     L1 -->|命中| R1["MatchResult(type=exact, confidence≥0.95)"]
@@ -5925,12 +7493,13 @@ from enum import Enum
 from typing import Optional
 
 
+<!-- FIXED: BLOCK-9 — MatchType 枚举：L2 保持 FUZZY，未匹配从 UNKNOWN 改为 NONE -->
 class MatchType(str, Enum):
     EXACT = "exact"                # L1: Speaker ID / 姓名精确
     ASR_CORRECTED = "asr_corrected"  # L1.5: ASR 纠错
-    FUZZY = "fuzzy"                # L2: 模糊匹配
+    FUZZY = "fuzzy"                # L2: 模糊匹配（PRD 4.6 规范值）
     INFERRED = "inferred"          # L3: 内容推断（疑似）
-    UNKNOWN = "unknown"            # 未匹配
+    NONE = "none"                  # 未匹配
 
 
 # ── 疑似匹配等级降级映射 ─────────────────────────────────
@@ -5957,7 +7526,7 @@ class MatchResult:
         有效等级：疑似匹配自动降级一档。
         exact / asr_corrected / fuzzy → 原始等级
         inferred → 降级后等级
-        unknown → P3
+        none → P3
         """
         if self.matched_person is None:
             return PersonLevel.P3
@@ -5984,16 +7553,19 @@ class KeyPersonMatcher:
         result = matcher.match(speaker_id="spk_017", speaker_name="张总")
     """
 
+    <!-- FIXED: 增加 max_level 参数，限制匹配的最大层级；llm_client 类型改为 ModelClient Protocol -->
     def __init__(
         self,
         config: ConfigSnapshot,
-        llm_client=None,
+        llm_client: Optional["ModelClient"] = None,  # <!-- FIXED: L3 LLM 接口改为 ModelClient Protocol -->
         cold_start_mode: bool = False,
+        max_level: int = 3,                           # <!-- FIXED: 增加 max_level 参数，1=仅L1, 2=L1+L1.5+L2, 3=全部含L3 -->
     ):
         self._kp_config = config.key_people
         self._asr_config = config.asr_corrections
         self._llm_client = llm_client
         self._cold_start_mode = cold_start_mode
+        self._max_level = max_level
 
         # Speaker ID 映射管理器
         self._sid_mapper = SpeakerIDMapper()
@@ -6013,36 +7585,48 @@ class KeyPersonMatcher:
         speaker_name: ASR 设备提供的名称提示（可能为空）
         utterance_text: 该说话人的代表性发言文本（L3 推断用）
         """
+        <!-- FIXED: 增加 max_level 控制；冷启动阈值 0.25 在 match() 中实际生效过滤低置信度结果 -->
         # L1: Speaker ID 精确匹配
         result = self._match_l1(speaker_id, speaker_name)
-        if result:
+        if result and self._check_confidence(result):
             return result
 
-        # L1.5: ASR 人名纠错
-        result = self._match_l1_5(speaker_id, speaker_name)
-        if result:
-            return result
+        # L1.5: ASR 人名纠错（max_level ≥ 2 时执行）
+        if self._max_level >= 2:
+            result = self._match_l1_5(speaker_id, speaker_name)
+            if result and self._check_confidence(result):
+                return result
 
-        # L2: 模糊匹配（姓名/别名/职务称谓正则）
-        result = self._match_l2(speaker_id, speaker_name)
-        if result:
-            return result
+        # L2: 模糊匹配（姓名/别名/职务称谓正则，max_level ≥ 2 时执行）
+        if self._max_level >= 2:
+            result = self._match_l2(speaker_id, speaker_name)
+            if result and self._check_confidence(result):
+                return result
 
-        # L3: 内容推断（LLM 辅助，仅在有 utterance_text 且配置了 LLM 时触发）
-        if utterance_text and self._llm_client:
+        # L3: 内容推断（LLM 辅助，仅 max_level ≥ 3 且有 utterance_text 且配置了 LLM 时触发）
+        if self._max_level >= 3 and utterance_text and self._llm_client:
             result = self._match_l3(speaker_id, speaker_name, utterance_text)
-            if result:
+            if result and self._check_confidence(result):
                 return result
 
         # 未匹配
         self._sid_mapper.record_unmatched(speaker_id, speaker_name)
         return MatchResult(
             matched_person=None,
-            match_type=MatchType.UNKNOWN,
+            match_type=MatchType.NONE,
             confidence=0.0,
             raw_speaker_id=speaker_id,
             raw_speaker_name=speaker_name,
         )
+
+    def _check_confidence(self, result: MatchResult) -> bool:
+        """
+        <!-- FIXED: 冷启动阈值 0.25 在此处实际生效 -->
+        检查匹配结果的置信度是否超过阈值。
+        冷启动期统一使用 0.25；稳定期按关键人等级分级。
+        """
+        threshold = self.get_confidence_threshold(result.matched_person)
+        return result.confidence >= threshold
 
     # ── L1: Speaker ID + 姓名精确匹配 ─────────────────
     def _match_l1(self, speaker_id: str, speaker_name: str) -> Optional[MatchResult]:
@@ -6169,13 +7753,21 @@ class KeyPersonMatcher:
 仅输出 JSON，不要输出其他内容。"""
 
         try:
-            response = self._llm_client.call(
-                prompt=prompt,
-                max_tokens=128,
-                temperature=0,
-                enable_thinking=False,
+            # <!-- FIXED: L3 LLM 接口改为 ModelClient Protocol 的 chat_completion -->
+            import asyncio
+            messages = [
+                ChatMessage(role="system", content="你是一个说话人身份推断助手。仅输出 JSON，不要输出其他内容。"),
+                ChatMessage(role="user", content=prompt),
+            ]
+            response = asyncio.get_event_loop().run_until_complete(
+                self._llm_client.chat_completion(
+                    messages=messages,
+                    max_tokens=128,
+                    temperature=0,
+                    enable_thinking=False,
+                )
             )
-            result_json = self._parse_l3_response(response)
+            result_json = self._parse_l3_response(response.content)
 
             if result_json and result_json.get("person_id"):
                 person = self._find_person_by_id(result_json["person_id"])
@@ -6261,12 +7853,12 @@ flowchart TD
     L2_HIT -->|是| R_FUZZY["return FUZZY, conf=0.87"]
     L2_HIT -->|否| L3_CHECK
 
-    L3_CHECK -->|否| R_UNKNOWN["return UNKNOWN, conf=0.0"]
+    L3_CHECK -->|否| R_NONE["return NONE, conf=0.0"]
     L3_CHECK -->|是| L3_LLM
     L3_LLM --> L3_PARSE
     L3_PARSE --> L3_HIT
     L3_HIT -->|是| R_INFERRED["return INFERRED, conf=0.75"]
-    L3_HIT -->|否| R_UNKNOWN
+    L3_HIT -->|否| R_NONE
 ```
 
 ### 13.4 Speaker ID 映射管理
@@ -6525,7 +8117,7 @@ class MatchResult:
 
     核心字段说明：
     - matched_person: 匹配到的关键人配置对象，None 表示未匹配
-    - match_type: 匹配层级标识（exact/asr_corrected/fuzzy/inferred/unknown）
+    - match_type: 匹配层级标识（exact/asr_corrected/fuzzy/inferred/none）
     - confidence: 匹配置信度，0.0~1.0
     - effective_level: 计算属性，疑似匹配自动降级后的有效等级
     """

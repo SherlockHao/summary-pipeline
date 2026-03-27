@@ -49,6 +49,7 @@ class ConfigSnapshot:
     asr_corrections: "ASRCorrectionsConfig"
     time_periods: "TimePeriodConfig"
     model_params: "ModelParamsConfig"
+    chunking_strategy: "ChunkingStrategyConfig"  # <!-- FIXED: 增加 chunking_strategy.yaml 加载 -->
     loaded_at: datetime = field(default_factory=datetime.now)
     version_hash: str = ""  # 配置内容的 MD5，用于变更检测
 
@@ -117,28 +118,32 @@ class ConfigManager:
 
     # ── 内部构建逻辑 ──────────────────────────────────────
     def _build_snapshot(self) -> ConfigSnapshot:
+        <!-- FIXED: 增加 chunking_strategy.yaml 的加载 -->
         """读取所有 YAML -> Pydantic 校验 -> 构建不可变快照"""
         raw_kp = self._load_yaml("key_people.yaml")
         raw_asr = self._load_yaml("asr_name_corrections.yaml")
         raw_tp = self._load_yaml("time_period_config.yaml")
         raw_mp = self._load_yaml("model_params.yaml")
+        raw_cs = self._load_yaml("chunking_strategy.yaml")
 
         # Pydantic 校验（校验失败自动抛出 ValidationError）
         kp_config = KeyPeopleConfig(**raw_kp)
         asr_config = ASRCorrectionsConfig(**raw_asr)
         tp_config = TimePeriodConfig(**raw_tp)
         mp_config = ModelParamsConfig(**raw_mp)
+        cs_config = ChunkingStrategyConfig(**raw_cs)
 
         # 构建查找索引（预计算，提升匹配性能）
         kp_config.build_lookup_indices()
 
-        version_hash = self._compute_hash(raw_kp, raw_asr, raw_tp, raw_mp)
+        version_hash = self._compute_hash(raw_kp, raw_asr, raw_tp, raw_mp, raw_cs)
 
         return ConfigSnapshot(
             key_people=kp_config,
             asr_corrections=asr_config,
             time_periods=tp_config,
             model_params=mp_config,
+            chunking_strategy=cs_config,
             version_hash=version_hash,
         )
 
@@ -449,13 +454,22 @@ class TimePeriodConfig(BaseModel):
 
 #### 12.6.1 YAML 文件结构
 
+<!-- FIXED: BLOCK-8 — 合并为统一 Schema，补充 timeout / cost 区块；BLOCK-7 — daily_report max_tokens 对齐 32768；thinking_budget_default 统一为 16384 -->
 ```yaml
-# config/model_params.yaml
+# config/model_params.yaml — 统一权威定义
 model:
-  name: "qwen3-max-2026-01-23"       # 快照版本，禁止使用 qwen3-max
-  fallback: "qwen3-plus"              # 降级模型
-  thinking_budget_default: 16000
+  name: "qwen3-max-2026-01-23"       # 快照版本（统一单一 name 字段）
+  fallback: "qwen3-plus"              # 降级模型（对齐 PRD 2.4.2）
+  api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  api_key_env: "QWEN_API_KEY"
+  thinking_budget_default: 16384      # 统一为 16,384
   batch_api_enabled: true
+
+# 超时配置
+timeout:
+  normal: 30                          # 秒，普通请求
+  large_window: 120                   # 秒，大窗口请求（>100K tokens）
+  large_window_threshold: 100000      # tokens
 
 calls:
   segment_summary:
@@ -467,7 +481,7 @@ calls:
     enable_thinking: false
     temperature: 0.3
   daily_report:
-    max_tokens: 8000
+    max_tokens: 32768                 # 对齐思考模式最大输出
     enable_thinking: true
     thinking_budget: 16384
     temperature: 0.3
@@ -475,7 +489,7 @@ calls:
     max_tokens: 64
     enable_thinking: false
     temperature: 0
-    batch_size: 10              # 每批评估片段数
+    batch_size: 10
 
 token_budget:
   short_day_threshold: 80000     # 短日模式上限（tokens）
@@ -486,8 +500,21 @@ token_budget:
 
 retry:
   max_retries: 3
-  backoff_base: 1                # 指数退避基数（秒）
-  backoff_multiplier: 2          # 1s → 2s → 4s → 8s
+  backoff_base: 1.0              # 指数退避基数（秒）
+  backoff_multiplier: 2.0        # 1s → 2s → 4s → 8s
+  max_delay: 8.0                 # <!-- FIXED: BLOCK-8 --> 最大退避（秒）
+  retryable_status_codes: [429, 500, 502, 503]
+
+# <!-- FIXED: BLOCK-8 — 增加 timeout 和 cost 配置区块 -->
+timeout:
+  normal: 30                     # 秒，普通请求
+  large_window: 120              # 秒，大窗口请求（>100K tokens）
+  large_window_threshold: 100000 # tokens
+
+cost:
+  daily_limit_yuan: 10.0
+  monthly_limit_yuan: 200.0
+  alert_threshold_pct: 80
 ```
 
 #### 12.6.2 Pydantic 模型
@@ -502,10 +529,13 @@ class CallParams(BaseModel):
     batch_size: int = Field(default=1, ge=1, description="批量调用时每批片段数")
 
 
+<!-- FIXED: BLOCK-8 — thinking_budget_default 统一为 16384；模型名统一为 qwen3-max-2026-01-23；降级模型统一为 qwen3-plus -->
 class ModelSpec(BaseModel):
-    name: str = Field(..., description="模型快照版本")
-    fallback: str = Field(default="qwen3-plus", description="降级模型")
-    thinking_budget_default: int = Field(default=16000, ge=0)
+    name: str = Field(default="qwen3-max-2026-01-23", description="模型快照版本")
+    fallback: str = Field(default="qwen3-plus", description="降级模型（对齐 PRD 2.4.2）")
+    api_base: str = Field(default="https://dashscope.aliyuncs.com/compatible-mode/v1")
+    api_key_env: str = Field(default="QWEN_API_KEY", description="API Key 环境变量名")
+    thinking_budget_default: int = Field(default=16384, ge=0)
     batch_api_enabled: bool = True
 
 
@@ -517,10 +547,28 @@ class TokenBudget(BaseModel):
     safety_margin: int = 20000
 
 
+<!-- FIXED: BLOCK-8 — retry 字段统一为 backoff_base/backoff_multiplier/max_retries/max_delay -->
 class RetryConfig(BaseModel):
     max_retries: int = Field(default=3, ge=0)
     backoff_base: float = Field(default=1.0, ge=0)
     backoff_multiplier: float = Field(default=2.0, ge=1.0)
+    max_delay: float = Field(default=8.0, ge=0, description="最大退避（秒）")
+    retryable_status_codes: list[int] = Field(default=[429, 500, 502, 503])
+
+
+<!-- FIXED: BLOCK-8 — 配置模块增加 timeout 和 cost Pydantic 模型 -->
+class TimeoutConfig(BaseModel):
+    """超时配置"""
+    normal: int = Field(default=30, ge=1, description="普通请求超时（秒）")
+    large_window: int = Field(default=120, ge=1, description="大窗口请求超时（秒）")
+    large_window_threshold: int = Field(default=100000, ge=1, description="切换大超时的输入 token 阈值")
+
+
+class CostConfig(BaseModel):
+    """成本监控配置"""
+    daily_limit_yuan: float = Field(default=10.0, ge=0, description="日预算上限（元）")
+    monthly_limit_yuan: float = Field(default=200.0, ge=0, description="月预算上限（元）")
+    alert_threshold_pct: int = Field(default=80, ge=0, le=100, description="预算告警阈值百分比")
 
 
 class ModelParamsConfig(BaseModel):
@@ -531,6 +579,8 @@ class ModelParamsConfig(BaseModel):
     )
     token_budget: TokenBudget = Field(default_factory=TokenBudget)
     retry: RetryConfig = Field(default_factory=RetryConfig)
+    timeout: TimeoutConfig = Field(default_factory=TimeoutConfig)   # <!-- FIXED: BLOCK-8 — 增加 timeout 配置 -->
+    cost: CostConfig = Field(default_factory=CostConfig)           # <!-- FIXED: BLOCK-8 — 增加 cost 配置 -->
 
     def get_call_params(self, scenario: str) -> CallParams:
         if scenario not in self.calls:
@@ -549,7 +599,7 @@ sequenceDiagram
 
     Note over App: === 启动阶段 ===
     App->>CM: load_all()
-    CM->>FS: 读取 4 个 YAML 文件
+    CM->>FS: 读取 5 个 YAML 文件
     FS-->>CM: raw dict
     CM->>PD: 校验 KeyPeopleConfig / ASRCorrectionsConfig / ...
     alt 校验通过
@@ -590,7 +640,7 @@ flowchart TD
     L15{"L1.5: ASR 人名<br/>纠错查找"}
     L2{"L2: 姓名/别名<br/>模糊匹配"}
     L3{"L3: 内容推断<br/>LLM 辅助"}
-    MISS["未匹配:<br/>标记为 unknown"]
+    MISS["未匹配:<br/>标记为 NONE"]
 
     INPUT --> L1
     L1 -->|命中| R1["MatchResult(type=exact, confidence≥0.95)"]
@@ -612,12 +662,13 @@ from enum import Enum
 from typing import Optional
 
 
+<!-- FIXED: BLOCK-9 — MatchType 枚举：L2 保持 FUZZY，未匹配从 UNKNOWN 改为 NONE -->
 class MatchType(str, Enum):
     EXACT = "exact"                # L1: Speaker ID / 姓名精确
     ASR_CORRECTED = "asr_corrected"  # L1.5: ASR 纠错
-    FUZZY = "fuzzy"                # L2: 模糊匹配
+    FUZZY = "fuzzy"                # L2: 模糊匹配（PRD 4.6 规范值）
     INFERRED = "inferred"          # L3: 内容推断（疑似）
-    UNKNOWN = "unknown"            # 未匹配
+    NONE = "none"                  # 未匹配
 
 
 # ── 疑似匹配等级降级映射 ─────────────────────────────────
@@ -644,7 +695,7 @@ class MatchResult:
         有效等级：疑似匹配自动降级一档。
         exact / asr_corrected / fuzzy → 原始等级
         inferred → 降级后等级
-        unknown → P3
+        none → P3
         """
         if self.matched_person is None:
             return PersonLevel.P3
@@ -671,16 +722,19 @@ class KeyPersonMatcher:
         result = matcher.match(speaker_id="spk_017", speaker_name="张总")
     """
 
+    <!-- FIXED: 增加 max_level 参数，限制匹配的最大层级；llm_client 类型改为 ModelClient Protocol -->
     def __init__(
         self,
         config: ConfigSnapshot,
-        llm_client=None,
+        llm_client: Optional["ModelClient"] = None,  # <!-- FIXED: L3 LLM 接口改为 ModelClient Protocol -->
         cold_start_mode: bool = False,
+        max_level: int = 3,                           # <!-- FIXED: 增加 max_level 参数，1=仅L1, 2=L1+L1.5+L2, 3=全部含L3 -->
     ):
         self._kp_config = config.key_people
         self._asr_config = config.asr_corrections
         self._llm_client = llm_client
         self._cold_start_mode = cold_start_mode
+        self._max_level = max_level
 
         # Speaker ID 映射管理器
         self._sid_mapper = SpeakerIDMapper()
@@ -700,36 +754,48 @@ class KeyPersonMatcher:
         speaker_name: ASR 设备提供的名称提示（可能为空）
         utterance_text: 该说话人的代表性发言文本（L3 推断用）
         """
+        <!-- FIXED: 增加 max_level 控制；冷启动阈值 0.25 在 match() 中实际生效过滤低置信度结果 -->
         # L1: Speaker ID 精确匹配
         result = self._match_l1(speaker_id, speaker_name)
-        if result:
+        if result and self._check_confidence(result):
             return result
 
-        # L1.5: ASR 人名纠错
-        result = self._match_l1_5(speaker_id, speaker_name)
-        if result:
-            return result
+        # L1.5: ASR 人名纠错（max_level ≥ 2 时执行）
+        if self._max_level >= 2:
+            result = self._match_l1_5(speaker_id, speaker_name)
+            if result and self._check_confidence(result):
+                return result
 
-        # L2: 模糊匹配（姓名/别名/职务称谓正则）
-        result = self._match_l2(speaker_id, speaker_name)
-        if result:
-            return result
+        # L2: 模糊匹配（姓名/别名/职务称谓正则，max_level ≥ 2 时执行）
+        if self._max_level >= 2:
+            result = self._match_l2(speaker_id, speaker_name)
+            if result and self._check_confidence(result):
+                return result
 
-        # L3: 内容推断（LLM 辅助，仅在有 utterance_text 且配置了 LLM 时触发）
-        if utterance_text and self._llm_client:
+        # L3: 内容推断（LLM 辅助，仅 max_level ≥ 3 且有 utterance_text 且配置了 LLM 时触发）
+        if self._max_level >= 3 and utterance_text and self._llm_client:
             result = self._match_l3(speaker_id, speaker_name, utterance_text)
-            if result:
+            if result and self._check_confidence(result):
                 return result
 
         # 未匹配
         self._sid_mapper.record_unmatched(speaker_id, speaker_name)
         return MatchResult(
             matched_person=None,
-            match_type=MatchType.UNKNOWN,
+            match_type=MatchType.NONE,
             confidence=0.0,
             raw_speaker_id=speaker_id,
             raw_speaker_name=speaker_name,
         )
+
+    def _check_confidence(self, result: MatchResult) -> bool:
+        """
+        <!-- FIXED: 冷启动阈值 0.25 在此处实际生效 -->
+        检查匹配结果的置信度是否超过阈值。
+        冷启动期统一使用 0.25；稳定期按关键人等级分级。
+        """
+        threshold = self.get_confidence_threshold(result.matched_person)
+        return result.confidence >= threshold
 
     # ── L1: Speaker ID + 姓名精确匹配 ─────────────────
     def _match_l1(self, speaker_id: str, speaker_name: str) -> Optional[MatchResult]:
@@ -856,13 +922,21 @@ class KeyPersonMatcher:
 仅输出 JSON，不要输出其他内容。"""
 
         try:
-            response = self._llm_client.call(
-                prompt=prompt,
-                max_tokens=128,
-                temperature=0,
-                enable_thinking=False,
+            # <!-- FIXED: L3 LLM 接口改为 ModelClient Protocol 的 chat_completion -->
+            import asyncio
+            messages = [
+                ChatMessage(role="system", content="你是一个说话人身份推断助手。仅输出 JSON，不要输出其他内容。"),
+                ChatMessage(role="user", content=prompt),
+            ]
+            response = asyncio.get_event_loop().run_until_complete(
+                self._llm_client.chat_completion(
+                    messages=messages,
+                    max_tokens=128,
+                    temperature=0,
+                    enable_thinking=False,
+                )
             )
-            result_json = self._parse_l3_response(response)
+            result_json = self._parse_l3_response(response.content)
 
             if result_json and result_json.get("person_id"):
                 person = self._find_person_by_id(result_json["person_id"])
@@ -948,12 +1022,12 @@ flowchart TD
     L2_HIT -->|是| R_FUZZY["return FUZZY, conf=0.87"]
     L2_HIT -->|否| L3_CHECK
 
-    L3_CHECK -->|否| R_UNKNOWN["return UNKNOWN, conf=0.0"]
+    L3_CHECK -->|否| R_NONE["return NONE, conf=0.0"]
     L3_CHECK -->|是| L3_LLM
     L3_LLM --> L3_PARSE
     L3_PARSE --> L3_HIT
     L3_HIT -->|是| R_INFERRED["return INFERRED, conf=0.75"]
-    L3_HIT -->|否| R_UNKNOWN
+    L3_HIT -->|否| R_NONE
 ```
 
 ### 13.4 Speaker ID 映射管理
@@ -1212,7 +1286,7 @@ class MatchResult:
 
     核心字段说明：
     - matched_person: 匹配到的关键人配置对象，None 表示未匹配
-    - match_type: 匹配层级标识（exact/asr_corrected/fuzzy/inferred/unknown）
+    - match_type: 匹配层级标识（exact/asr_corrected/fuzzy/inferred/none）
     - confidence: 匹配置信度，0.0~1.0
     - effective_level: 计算属性，疑似匹配自动降级后的有效等级
     """

@@ -14,8 +14,21 @@
 
 ```python
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Protocol
 from enum import Enum
+
+
+<!-- FIXED: BLOCK-6 — 增加 ModelClient Protocol 定义 -->
+class ModelClient(Protocol):
+    """模型客户端协议——摘要模块依赖此抽象，不直接依赖 QwenClient"""
+    async def chat_completion(
+        self, messages: list["ChatMessage"], *,
+        model: Optional[str] = None,
+        enable_thinking: bool = False,
+        thinking_budget: Optional[int] = None,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+    ) -> "ChatCompletionResponse": ...
 
 
 class ThinkingMode(Enum):
@@ -52,11 +65,11 @@ class ChatCompletionResponse:
 class QwenClientConfig:
     """由 config/model_params.yaml 加载，运行时不可变"""
     api_base: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    model: str = "qwen3-max"                 # 生产环境应锁定快照版本
-    fallback_model: str = "qwen-plus"
+    model: str = "qwen3-max-2026-01-23"      # <!-- FIXED: BLOCK-8 --> 默认锁定快照版本
+    fallback_model: str = "qwen3-plus"       # <!-- FIXED: BLOCK-8 --> 对齐 PRD 2.4.2
     api_key_env: str = "QWEN_API_KEY"        # 从环境变量读取，不硬编码
-    default_temperature: float = 0.7
-    default_max_tokens: int = 8000
+    default_temperature: float = 0.3         # <!-- FIXED: 对齐配置模块场景默认值 -->
+    default_max_tokens: int = 32_768         # <!-- FIXED: BLOCK-7 --> 对齐思考模式最大输出
     timeout_normal: int = 30                 # 秒，普通请求
     timeout_large: int = 120                 # 秒，大窗口请求（>100K tokens）
     large_window_threshold: int = 100_000    # 输入 tokens 超过此值使用大超时
@@ -74,7 +87,8 @@ class QwenClient:
         """
         ...
 
-    def chat_completion(
+    <!-- FIXED: BLOCK-6 — chat_completion 改为 async def -->
+    async def chat_completion(
         self,
         messages: list[ChatMessage],
         *,
@@ -175,13 +189,13 @@ sequenceDiagram
 | 参数 | 来源 | 默认值 | 说明 |
 |:---|:---|:---|:---|
 | `api_base` | `config/model_params.yaml` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | OpenAI 兼容端点 |
-| `model` | `config/model_params.yaml` | `qwen3-max`（生产应锁快照版本） | 模型标识 |
+| `model` | `config/model_params.yaml` | `qwen3-max-2026-01-23`（快照版本） | 模型标识 <!-- FIXED: BLOCK-8 --> |
 | `api_key` | 环境变量 `QWEN_API_KEY` | — | **禁止硬编码** |
 | `timeout_normal` | `config/model_params.yaml` | 30s | 普通请求超时 |
 | `timeout_large` | `config/model_params.yaml` | 120s | 大窗口请求超时 |
 | `large_window_threshold` | `config/model_params.yaml` | 100,000 tokens | 切换至大超时的阈值 |
-| `default_temperature` | `config/model_params.yaml` | 0.7 | 默认采样温度 |
-| `default_max_tokens` | `config/model_params.yaml` | 8,000 | 默认最大输出 tokens |
+| `default_temperature` | `config/model_params.yaml` | 0.3 | 默认采样温度 <!-- FIXED: 对齐配置模块 --> |
+| `default_max_tokens` | `config/model_params.yaml` | 32,768 | 默认最大输出 tokens <!-- FIXED: BLOCK-7 --> |
 
 ### 8.5 错误处理矩阵
 
@@ -418,15 +432,16 @@ import time
 T = TypeVar("T")
 
 
+<!-- FIXED: BLOCK-8 — 统一 retry 字段名为 backoff_base / backoff_multiplier / max_retries / max_delay -->
 @dataclass
 class RetryConfig:
     """重试策略配置"""
     max_retries: int = 3
-    base_delay: float = 1.0              # 初始退避（秒）
-    max_delay: float = 8.0               # 最大退避（秒）
-    backoff_factor: float = 2.0          # 退避乘数：1s → 2s → 4s → 8s
+    backoff_base: float = 1.0            # 初始退避（秒）
+    max_delay: float = 8.0              # 最大退避（秒）
+    backoff_multiplier: float = 2.0      # 退避乘数：1s → 2s → 4s → 8s
     retryable_status_codes: tuple = (429, 500, 502, 503)
-    fallback_model: str = "qwen-plus"    # 3 次失败后降级模型
+    fallback_model: str = "qwen3-plus"   # <!-- FIXED: BLOCK-8 --> 降级模型对齐 PRD 2.4.2
 
 
 @dataclass
@@ -511,7 +526,7 @@ class RetryHandler:
     def _calculate_delay(self, attempt: int) -> float:
         """
         计算第 attempt 次重试的等待时间：
-        delay = min(base_delay * (backoff_factor ** attempt), max_delay)
+        delay = min(backoff_base * (backoff_multiplier ** attempt), max_delay)
         即：1s, 2s, 4s, 8s
         """
         ...
@@ -557,10 +572,10 @@ sequenceDiagram
     end
 
     Note over RH: 3 次重试均失败，触发降级
-    RH->>FQC: chat_completion(messages, model=qwen-plus)
+    RH->>FQC: chat_completion(messages, model=qwen3-plus)
     alt 降级成功
         FQC-->>RH: ChatCompletionResponse
-        RH->>CT: record(usage, model=qwen-plus, is_fallback=True)
+        RH->>CT: record(usage, model=qwen3-plus, is_fallback=True)
         RH-->>Caller: ChatCompletionResponse
     else 降级也失败
         FQC-->>RH: Error
@@ -573,21 +588,21 @@ sequenceDiagram
 | 参数 | 来源 | 默认值 | 说明 |
 |:---|:---|:---|:---|
 | `max_retries` | `config/model_params.yaml` | 3 | 最大重试次数 |
-| `base_delay` | `config/model_params.yaml` | 1.0s | 首次退避延迟 |
+| `backoff_base` | `config/model_params.yaml` | 1.0s | 首次退避延迟 <!-- FIXED: BLOCK-8 --> |
 | `max_delay` | `config/model_params.yaml` | 8.0s | 退避上限 |
-| `backoff_factor` | `config/model_params.yaml` | 2.0 | 指数退避乘数 |
-| `fallback_model` | `config/model_params.yaml` | `qwen-plus` | 降级模型 |
+| `backoff_multiplier` | `config/model_params.yaml` | 2.0 | 指数退避乘数 <!-- FIXED: BLOCK-8 --> |
+| `fallback_model` | `config/model_params.yaml` | `qwen3-plus` | 降级模型 <!-- FIXED: BLOCK-8 --> |
 | `daily_cost_limit` | `config/model_params.yaml` | 10.0 (元) | 日预算告警阈值 |
 
 ### 10.5 错误处理矩阵
 
 | 错误类型 | HTTP 状态码 | 可重试 | 重试策略 | 最终降级 |
 |:---|:---|:---|:---|:---|
-| Rate Limit | 429 | 是 | 指数退避 1→2→4→8s | 切换 qwen-plus |
-| Server Error | 500 | 是 | 指数退避 | 切换 qwen-plus |
-| Bad Gateway | 502 | 是 | 指数退避 | 切换 qwen-plus |
-| Service Unavailable | 503 | 是 | 指数退避 | 切换 qwen-plus |
-| 请求超时 | — | 是 | 指数退避 | 切换 qwen-plus |
+| Rate Limit | 429 | 是 | 指数退避 1→2→4→8s | 切换 qwen3-plus |
+| Server Error | 500 | 是 | 指数退避 | 切换 qwen3-plus |
+| Bad Gateway | 502 | 是 | 指数退避 | 切换 qwen3-plus |
+| Service Unavailable | 503 | 是 | 指数退避 | 切换 qwen3-plus |
+| 请求超时 | — | 是 | 指数退避 | 切换 qwen3-plus |
 | Bad Request | 400 | **否** | 立即终止 | 抛出异常，不降级 |
 | Unauthorized | 401 | **否** | 立即终止 | 抛出异常，告警通知 |
 | 降级模型也失败 | any | **否** | — | 抛出 `QwenExhaustedError`，进入人工队列 |
@@ -653,6 +668,7 @@ class ChunkPlan:
     overflow_tokens: int            # 触发分片的溢出量
 
 
+<!-- FIXED: BLOCK-7 — 修正 Token 预算参数，对齐 PRD ≥20,000 安全余量 & 思考模式最大输出 32,768 -->
 @dataclass
 class TokenBudgetConfig:
     model_context_limit: int = 262_144
@@ -661,11 +677,11 @@ class TokenBudgetConfig:
     key_people_tokens: int = 500                 # 关键人配置注入上限
     output_tokens_segment: int = 4_000           # 片段级输出预留
     output_tokens_session: int = 6_000           # 时段级输出预留
-    output_tokens_daily: int = 8_000             # 全天级输出预留
+    output_tokens_daily: int = 32_768            # 全天级输出预留（对齐思考模式最大输出）
     thinking_budget_default: int = 16_384        # 思考模式默认预算
     compact_prompt_threshold: int = 190_000      # 内容载荷超此值切换精简提示词
     chunking_trigger_threshold: int = 200_000    # 超此值触发分片
-    safety_margin_tokens: int = 2_000            # 安全余量
+    safety_margin_tokens: int = 20_000           # 安全余量（对齐 PRD ≥20,000）
 
 
 class TokenBudgetController:
@@ -737,8 +753,9 @@ class TokenBudgetController:
         thinking_budget: Optional[int] = None,
     ) -> int:
         """
+        <!-- FIXED: BLOCK-7 — 按场景区分输出预留 -->
         计算输出预留 tokens：
-        - 基础预留：segment=4K, session=6K, daily=8K
+        - 基础预留：segment=4,000 / session=6,000 / daily=32,768
         - 思考模式：额外加 thinking_budget（默认 16,384）
         """
         ...
@@ -758,9 +775,9 @@ sequenceDiagram
     QC-->>TBC: content_tokens = 95,000
 
     TBC->>TBC: select_prompt_version(95,000) → FULL
-    TBC->>TBC: get_output_reserve("daily", True, 16384) → 24,384
-    TBC->>TBC: total = 1,500 + 500 + 95,000 + 24,384 = 121,384
-    TBC->>TBC: 121,384 ≤ 262,144 → within_budget = True
+    TBC->>TBC: get_output_reserve("daily", True, 16384) → 49,152
+    TBC->>TBC: total = 1,500 + 500 + 95,000 + 49,152 + 20,000 = 166,152
+    TBC->>TBC: 166,152 ≤ 262,144 → within_budget = True
 
     TBC-->>Orch: (BudgetAllocation(within_budget=True), None)
     Note over Orch: 无需分片，直接单次调用
@@ -771,7 +788,7 @@ sequenceDiagram
         TBC->>QC: count_tokens(huge_text)
         QC-->>TBC: content_tokens = 220,000
         TBC->>TBC: select_prompt_version(220,000) → COMPACT
-        TBC->>TBC: total = 800 + 500 + 220,000 + 24,384 = 245,684
+        TBC->>TBC: total = 800 + 500 + 220,000 + 49,152 + 20,000 = 290,452
         TBC->>TBC: content > chunking_trigger_threshold(200K) → 需要分片
         TBC->>TBC: plan_chunks(overflow=20,000, total=220,000)
         TBC-->>Orch: (BudgetAllocation(within_budget=False), ChunkPlan(num_chunks=2, target=180,000))
@@ -787,13 +804,13 @@ sequenceDiagram
 | `system_prompt_full_tokens` | `config/model_params.yaml` | 1,500 | 完整提示词预估 token 数 |
 | `system_prompt_compact_tokens` | `config/model_params.yaml` | 800 | 精简提示词预估 token 数 |
 | `key_people_tokens` | `config/model_params.yaml` | 500 | 关键人注入上限 |
-| `output_tokens_segment` | `config/model_params.yaml` | 4,000 | 片段级输出预留 |
-| `output_tokens_session` | `config/model_params.yaml` | 6,000 | 时段级输出预留 |
-| `output_tokens_daily` | `config/model_params.yaml` | 8,000 | 全天级输出预留 |
+| `output_tokens_segment` | `config/model_params.yaml` | 4,000 | 片段级输出预留 <!-- FIXED: BLOCK-7 --> |
+| `output_tokens_session` | `config/model_params.yaml` | 6,000 | 时段级输出预留 <!-- FIXED: BLOCK-7 --> |
+| `output_tokens_daily` | `config/model_params.yaml` | 32,768 | 全天级输出预留（对齐思考模式最大输出）<!-- FIXED: BLOCK-7 --> |
 | `thinking_budget_default` | `config/model_params.yaml` | 16,384 | 默认思维链预算 |
 | `compact_prompt_threshold` | `config/model_params.yaml` | 190,000 | 切换精简提示词的内容阈值 |
 | `chunking_trigger_threshold` | `config/model_params.yaml` | 200,000 | 触发分片的内容阈值 |
-| `safety_margin_tokens` | `config/model_params.yaml` | 2,000 | 安全余量 |
+| `safety_margin_tokens` | `config/model_params.yaml` | 20,000 | 安全余量（对齐 PRD ≥20,000）<!-- FIXED: BLOCK-7 --> |
 
 ### 11.5 错误处理矩阵
 
@@ -848,16 +865,20 @@ class TokenBudgetExceededError(QwenBaseError):
 
 ---
 
-## 附录：`config/model_params.yaml` 完整参考
+<!-- FIXED: BLOCK-8 — 附录 YAML 改为引用配置模块的统一定义，此处仅保留 API 层视角的快速参考 -->
+## 附录：`config/model_params.yaml` 快速参考
+
+> **权威定义**位于配置模块（模块 12）的 `ModelParamsConfig` Pydantic 模型。以下为 API 层消费的关键字段摘要，完整 Schema 以配置模块为准。
 
 ```yaml
-# Qwen3-Max 模型配置
+# config/model_params.yaml — 统一 Schema（权威定义见配置模块 12.6）
 model:
-  name: "qwen3-max"                      # 开发环境；生产必须锁快照版本
-  snapshot: "qwen3-max-2026-01-23"        # 生产版本
-  fallback: "qwen-plus"                   # 降级模型
+  name: "qwen3-max-2026-01-23"            # 快照版本（统一使用单一 name 字段）
+  fallback: "qwen3-plus"                   # 降级模型（对齐 PRD 2.4.2）
   api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
-  api_key_env: "QWEN_API_KEY"             # 环境变量名
+  api_key_env: "QWEN_API_KEY"
+  thinking_budget_default: 16384
+  batch_api_enabled: true
 
 # 超时配置
 timeout:
@@ -865,26 +886,26 @@ timeout:
   large_window: 120                       # 秒
   large_window_threshold: 100000          # tokens
 
-# 默认推理参数
-inference:
-  temperature: 0.7
-  max_tokens: 8000
-  thinking_budget_default: 16384
-
-# 重试策略
-retry:
-  max_retries: 3
-  base_delay: 1.0
-  max_delay: 8.0
-  backoff_factor: 2.0
-  retryable_status_codes: [429, 500, 502, 503]
-
-# Batch API
-batch:
-  enabled: true
-  poll_interval: 30                       # 秒
-  poll_timeout: 3600                      # 秒
-  max_tasks_per_batch: 100
+# 各场景调用参数
+calls:
+  segment_summary:
+    max_tokens: 4000
+    enable_thinking: false
+    temperature: 0.3
+  period_summary:
+    max_tokens: 6000
+    enable_thinking: false
+    temperature: 0.3
+  daily_report:
+    max_tokens: 32768                     # 对齐思考模式最大输出
+    enable_thinking: true
+    thinking_budget: 16384
+    temperature: 0.3
+  importance_eval:
+    max_tokens: 64
+    enable_thinking: false
+    temperature: 0
+    batch_size: 10
 
 # Token 预算
 token_budget:
@@ -895,14 +916,33 @@ token_budget:
   output_tokens:
     segment: 4000
     session: 6000
-    daily: 8000
+    daily: 32768                          # 对齐思考模式最大输出
   compact_prompt_threshold: 190000
   chunking_trigger_threshold: 200000
-  safety_margin: 2000
+  safety_margin: 20000                    # 对齐 PRD ≥20,000
+  short_day_threshold: 80000
+  long_day_max: 250000
+  system_prompt_budget: 2000
+  key_people_inject_budget: 600
+
+# 重试策略（统一字段名）
+retry:
+  max_retries: 3
+  backoff_base: 1.0
+  backoff_multiplier: 2.0
+  max_delay: 8.0
+  retryable_status_codes: [429, 500, 502, 503]
+
+# Batch API
+batch:
+  enabled: true
+  poll_interval: 30
+  poll_timeout: 3600
+  max_tasks_per_batch: 100
 
 # 成本监控
 cost:
   daily_limit_yuan: 10.0
   monthly_limit_yuan: 200.0
-  alert_threshold_pct: 80                 # 达到 80% 预算时告警
+  alert_threshold_pct: 80
 ```

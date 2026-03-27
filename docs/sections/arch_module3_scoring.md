@@ -8,6 +8,67 @@
 
 ## 6.1 数据模型（models/scoring.py）
 
+<!-- FIXED: BLOCK-2 — 评分模块直接使用分片引擎输出的 Chunk 类型，不再使用未定义的 Segment -->
+
+### 6.1.0 Chunk 类型说明与 LLMClient / match_speaker_to_key_person 接口
+
+评分模块的输入片段类型统一为分片引擎输出的 `Chunk`（定义于 `models/types.py`）。
+原文档中的 `Segment` 即 `Chunk`，不再单独定义 `Segment` 类型。
+
+```python
+from models.types import Chunk
+# 评分模块中所有"片段"均为 Chunk，关键字段映射：
+#   chunk.chunk_id   — 片段唯一标识（原 segment.id）
+#   chunk.text       — 拼接后的文本（原 segment.text）
+#   chunk.speakers   — 说话人列表（原 segment.speakers）
+#   chunk.start_time — 片段起始时间，float 秒（原 segment.start_time）
+#   chunk.end_time   — 片段结束时间，float 秒
+#   chunk.total_tokens — 片段 token 数
+```
+
+<!-- FIXED: 补充 LLMClient 接口定义，指向 ModelClient 协议 -->
+
+**LLMClient 接口**：评分模块中引用的 `LLMClient` 实际对应 API 层定义的 `ModelClient` 协议
+（定义于 `core/model_client.py`）。评分模块通过依赖注入获取该客户端实例：
+
+```python
+from typing import Protocol
+
+class ModelClient(Protocol):
+    """模型客户端协议（定义于 core/model_client.py）。
+    评分模块中的 LLMClient 即此协议。"""
+
+    async def chat_completion(
+        self,
+        messages: list[dict],
+        max_tokens: int = 2048,
+        temperature: float = 0.7,
+        enable_thinking: bool = False,
+    ) -> "ChatCompletionResponse": ...
+```
+
+<!-- FIXED: 补充 match_speaker_to_key_person 函数签名 -->
+
+**match_speaker_to_key_person 函数**：由配置模块的 `KeyPersonMatcher` 提供
+（定义于 `core/key_person_matcher.py`）：
+
+```python
+from models.types import MatchResult
+
+def match_speaker_to_key_person(
+    speaker: str,
+    key_people_config: dict,
+) -> MatchResult | None:
+    """将说话人名称匹配至关键人配置。
+
+    Returns:
+        MatchResult(level="P0"~"P3", match_type="exact"|"alias"|"fuzzy"|"inferred")
+        若无匹配返回 None。
+    详见配置模块 KeyPersonMatcher 实现。
+    """
+    ...
+```
+
 ### 6.1.1 ScoringPhase 枚举
 
 标识当前评分器所处的实施阶段，决定评分公式选型与字段填充策略。
@@ -95,7 +156,7 @@ from datetime import datetime
 class ScoreBreakdown:
     """单个片段的评分分解记录。"""
 
-    segment_id: str
+    segment_id: str                      # 对应 Chunk.chunk_id
 
     # ---- 关键人维度 ----
     key_person_level: Optional[str]      # "P0" / "P1" / "P2" / "P3" / None
@@ -131,7 +192,39 @@ class ScoreBreakdown:
     phase: ScoringPhase = ScoringPhase.MVP
 ```
 
-### 6.1.4 数据模型关系图
+<!-- FIXED: BLOCK-3 — 新增 ScoringResult 数据类，替代裸 tuple 返回 -->
+
+### 6.1.4 ScoringResult 数据类
+
+评分模块的统一输出容器，替代原有的裸 `tuple` 返回。同时提供"按分数降序"和"按时间升序"两个视图。
+
+```python
+from dataclasses import dataclass
+from models.types import Chunk, SummaryMode
+
+@dataclass
+class ScoringResult:
+    """评分模块统一输出。evaluate() 返回此类型而非裸 tuple。"""
+
+    all_chunks: list[Chunk]                # 全量片段，按时间升序
+    all_breakdowns: list[ScoreBreakdown]   # 全量评分记录，与 all_chunks 一一对应
+    filtered_chunks: list[Chunk]           # Top-K 筛选后，按分数降序
+    filtered_breakdowns: list[ScoreBreakdown]  # 与 filtered_chunks 一一对应
+    mode: SummaryMode                      # SHORT_DAY / LONG_DAY / DEGRADED
+
+    def filtered_by_time(self) -> tuple[list[Chunk], list[ScoreBreakdown]]:
+        """返回筛选后片段按时间升序排列的视图（摘要生成模块需要此顺序）。"""
+        paired = list(zip(self.filtered_chunks, self.filtered_breakdowns))
+        paired.sort(key=lambda pair: pair[0].start_time)
+        return [c for c, _ in paired], [b for _, b in paired]
+```
+
+> **输出视图说明**：
+> - `filtered_chunks` / `filtered_breakdowns`：按 FinalScore **降序**，用于调试和重要性展示。
+> - `filtered_by_time()`：按 `start_time` **升序**，用于摘要生成模块按时间线拼接文本。
+> - `all_chunks` / `all_breakdowns`：全量数据按时间升序，SHORT_DAY 模式下 `filtered_chunks == all_chunks`。
+
+### 6.1.5 数据模型关系图
 
 ```mermaid
 classDiagram
@@ -178,8 +271,19 @@ classDiagram
         +phase: ScoringPhase
     }
 
+    class ScoringResult {
+        +all_chunks: list~Chunk~
+        +all_breakdowns: list~ScoreBreakdown~
+        +filtered_chunks: list~Chunk~
+        +filtered_breakdowns: list~ScoreBreakdown~
+        +mode: SummaryMode
+        +filtered_by_time() tuple
+    }
+
     ScoringConfig --> ScoringPhase
     ScoreBreakdown --> ScoringPhase
+    ScoringResult --> ScoreBreakdown
+    ScoringResult --> ScoringPhase
 ```
 
 ---
@@ -190,12 +294,15 @@ classDiagram
 
 ```mermaid
 flowchart TD
-    A[输入: 片段列表 + 关键人配置] --> B[Step 1: 计算 KeyPersonBaseScore]
+    A["输入: Chunk 列表 + 关键人配置 + mode"] --> B[Step 1: 计算 KeyPersonBaseScore]
     B --> C[Step 2: LLM 批量评分]
     C --> D[Step 3: 合成 FinalScore]
     D --> E[Step 4: 连续性保护]
-    E --> F[Step 5: 阈值筛选 + Top-K]
-    F --> G[输出: 排序片段列表 + ScoreBreakdown 列表]
+    E --> F{"mode == SHORT_DAY?"}
+    F -- 是 --> G["跳过 Top-K，全量输出"]
+    F -- 否 --> H["Step 5: 阈值筛选 + Top-K"]
+    G --> I["输出: ScoringResult<br/>(全量 + 筛选 + 双视图)"]
+    H --> I
 ```
 
 ### 6.2.2 KeyPersonBaseScore 计算逻辑
@@ -204,7 +311,7 @@ flowchart TD
 
 ```python
 def compute_key_person_base_score(
-    segment: Segment,
+    chunk: Chunk,
     key_people_config: dict,
     config: ScoringConfig,
 ) -> tuple[int, str | None, str | None, str | None]:
@@ -219,7 +326,7 @@ def compute_key_person_base_score(
 
     LEVEL_PRIORITY = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 
-    for speaker in segment.speakers:
+    for speaker in chunk.speakers:
         match = match_speaker_to_key_person(speaker, key_people_config)
         if match is None:
             continue
@@ -262,7 +369,7 @@ def compute_key_person_base_score(
 #### 分批逻辑
 
 ```python
-def batch_segments(segments: list[Segment], batch_size: int) -> list[list[Segment]]:
+def batch_segments(segments: list[Chunk], batch_size: int) -> list[list[Chunk]]:
     """将片段列表按 batch_size 切分为多个批次。"""
     return [
         segments[i : i + batch_size]
@@ -280,7 +387,7 @@ LLM_SCORING_PROMPT_TEMPLATE = """请评估以下 {n} 个对话片段的重要性
 
 请按顺序输出 {n} 个分数，用逗号分隔，仅输出数字。"""
 
-def build_scoring_prompt(batch: list[Segment]) -> str:
+def build_scoring_prompt(batch: list[Chunk]) -> str:
     """构造单批次的评分 Prompt。"""
     parts = []
     for i, seg in enumerate(batch, 1):
@@ -298,8 +405,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 async def call_llm_for_scores(
-    batch: list[Segment],
-    llm_client: LLMClient,
+    batch: list[Chunk],
+    llm_client: ModelClient,
     config: ScoringConfig,
 ) -> list[int]:
     """调用 LLM 对一批片段进行语义评分。
@@ -312,7 +419,8 @@ async def call_llm_for_scores(
     """
     prompt = build_scoring_prompt(batch)
 
-    response = await llm_client.complete(
+    # <!-- FIXED: BLOCK-2 — llm_client.complete() → chat_completion()，与 ModelClient 协议一致 -->
+    response = await llm_client.chat_completion(
         messages=[{"role": "user", "content": prompt}],
         max_tokens=config.llm_max_tokens,       # 64
         temperature=config.llm_temperature,      # 0.0
@@ -442,17 +550,19 @@ $$\text{bonus} = \text{neighbor\_score} \times 0.3 \times \max\left(0,\ 1 - \fra
 
 ### 6.3.4 算法伪代码
 
+<!-- FIXED: .total_seconds() 类型错误 — start_time/end_time 已经是 float 秒，直接做差除以 60 -->
+
 ```python
 def apply_continuity_protection(
-    segments: list[Segment],
+    chunks: list[Chunk],
     breakdowns: list[ScoreBreakdown],
     config: ScoringConfig,
 ) -> list[ScoreBreakdown]:
     """对已计算 FinalScore 的片段列表应用连续性保护。
 
-    前提：segments 和 breakdowns 按时间顺序一一对应。
+    前提：chunks 和 breakdowns 按时间顺序一一对应。
     """
-    n = len(segments)
+    n = len(chunks)
     # 记录每个片段的原始 FinalScore（不含 bonus），用于传播计算
     original_scores = [bd.final_score for bd in breakdowns]
 
@@ -471,9 +581,10 @@ def apply_continuity_protection(
                 continue
 
             # 计算时间间隔（分钟）
+            # NOTE: start_time / end_time 均为 float（秒），直接做差即可，无需 .total_seconds()
             interval = abs(
-                segments[i].start_time - segments[neighbor_idx].end_time
-            ).total_seconds() / 60.0
+                chunks[i].start_time - chunks[neighbor_idx].end_time
+            ) / 60.0
 
             # 超过最大间隔则不传播
             if interval >= config.continuity_max_interval:
@@ -560,10 +671,10 @@ import math
 from typing import Optional
 
 def filter_and_rank(
-    segments: list[Segment],
+    chunks: list[Chunk],
     breakdowns: list[ScoreBreakdown],
     config: ScoringConfig,
-) -> tuple[list[Segment], list[ScoreBreakdown]]:
+) -> tuple[list[Chunk], list[ScoreBreakdown]]:
     """阈值筛选 + Top-K 排序。
 
     Returns:
@@ -571,8 +682,8 @@ def filter_and_rank(
     """
     # Step 1: 阈值筛选
     candidates = [
-        (seg, bd)
-        for seg, bd in zip(segments, breakdowns)
+        (chunk, bd)
+        for chunk, bd in zip(chunks, breakdowns)
         if bd.final_score >= config.threshold
     ]
 
@@ -605,15 +716,15 @@ def filter_and_rank(
     for rank, (_, bd) in enumerate(selected, 1):
         bd.rank_in_topk = rank
 
-    result_segments = [seg for seg, _ in selected]
+    result_chunks = [chunk for chunk, _ in selected]
     result_breakdowns = [bd for _, bd in selected]
 
     logger.info(
         "筛选完成: 总数=%d, 过阈值=%d, Top-K=%d, K_effective=%d, 最终保留=%d",
-        len(segments), len(candidates), k, k_effective, len(selected),
+        len(chunks), len(candidates), k, k_effective, len(selected),
     )
 
-    return result_segments, result_breakdowns
+    return result_chunks, result_breakdowns
 ```
 
 ### 6.4.4 筛选流程图
@@ -629,7 +740,7 @@ flowchart TD
     F --> H["Step 3: 取前 K_eff 个片段"]
     G --> H
     H --> I["标记 rank_in_topk"]
-    I --> J["输出: 排序片段列表 + ScoreBreakdown 列表"]
+    I --> J["输出: 筛选后 Chunk 列表 + ScoreBreakdown（按分数降序）"]
 ```
 
 ---
@@ -640,31 +751,52 @@ flowchart TD
 
 完整阶段评分器继承 MVP 评分器，在其基础上扩展三个新维度并引入权重配置。
 
+<!-- FIXED: BLOCK-3 — evaluate() 返回 ScoringResult 而非裸 tuple -->
+<!-- FIXED: BLOCK-4 — evaluate() 增加 mode: SummaryMode 参数，SHORT_DAY 跳过 Top-K -->
+<!-- FIXED: 补充 LLMClient 指向 ModelClient 协议 -->
+
 ```python
 import math
+from models.types import SummaryMode
 
 class MVPImportanceEvaluator:
     """MVP 阶段重要性评估器。"""
 
-    def __init__(self, config: ScoringConfig, llm_client: LLMClient):
+    def __init__(self, config: ScoringConfig, llm_client: ModelClient):
+        """
+        Args:
+            config: 评分配置
+            llm_client: 模型客户端，实现 ModelClient 协议（定义于 core/model_client.py）
+        """
         self.config = config
         self.llm_client = llm_client
 
     async def evaluate(
         self,
-        segments: list[Segment],
+        chunks: list[Chunk],
         key_people_config: dict,
-    ) -> tuple[list[Segment], list[ScoreBreakdown]]:
-        """完整评估流程：基础分 → LLM评分 → 合成 → 连续性 → 筛选。"""
+        mode: SummaryMode = SummaryMode.LONG_DAY,
+    ) -> ScoringResult:
+        """完整评估流程：基础分 → LLM评分 → 合成 → 连续性 → 筛选。
+
+        Args:
+            chunks: 分片引擎输出的 Chunk 列表（按时间升序）
+            key_people_config: 关键人配置字典
+            mode: 摘要模式。SHORT_DAY 跳过 Top-K 筛选，全量输出；
+                  LONG_DAY / DEGRADED 执行正常的阈值 + Top-K 筛选。
+
+        Returns:
+            ScoringResult 包含全量和筛选后的两组数据，以及模式标记。
+        """
         breakdowns = []
 
         # Step 1: KeyPersonBaseScore
-        for seg in segments:
+        for chunk in chunks:
             base_score, level, match_type, eff_level = (
-                compute_key_person_base_score(seg, key_people_config, self.config)
+                compute_key_person_base_score(chunk, key_people_config, self.config)
             )
             bd = ScoreBreakdown(
-                segment_id=seg.id,
+                segment_id=chunk.chunk_id,  # Chunk.chunk_id 作为片段唯一标识
                 key_person_level=level,
                 match_type=match_type,
                 effective_level=eff_level,
@@ -674,7 +806,7 @@ class MVPImportanceEvaluator:
             breakdowns.append(bd)
 
         # Step 2: LLM 批量评分
-        llm_scores = await self._batch_llm_scoring(segments)
+        llm_scores = await self._batch_llm_scoring(chunks)
         for bd, score in zip(breakdowns, llm_scores):
             bd.llm_score = score
             bd.llm_score_weighted = score * self.config.llm_score_multiplier
@@ -684,19 +816,44 @@ class MVPImportanceEvaluator:
             bd.final_score = self._compute_final_score(bd)
 
         # Step 4: 连续性保护
-        breakdowns = apply_continuity_protection(segments, breakdowns, self.config)
+        breakdowns = apply_continuity_protection(chunks, breakdowns, self.config)
 
-        # Step 5: 阈值 + Top-K
-        return filter_and_rank(segments, breakdowns, self.config)
+        # Step 5: 阈值 + Top-K（根据 mode 决定是否跳过）
+        if mode == SummaryMode.SHORT_DAY:
+            # 短日模式：跳过 Top-K 筛选，评分仅用于排序展示，不裁剪内容
+            # filtered = all（全量），但仍按分数降序排列以便展示
+            sorted_pairs = sorted(
+                zip(chunks, breakdowns),
+                key=lambda pair: pair[1].final_score,
+                reverse=True,
+            )
+            filtered_chunks = [c for c, _ in sorted_pairs]
+            filtered_breakdowns = [b for _, b in sorted_pairs]
+            for rank, bd in enumerate(filtered_breakdowns, 1):
+                bd.passed_threshold = True
+                bd.rank_in_topk = rank
+        else:
+            # LONG_DAY / DEGRADED：执行正常的阈值 + Top-K 筛选
+            filtered_chunks, filtered_breakdowns = filter_and_rank(
+                chunks, breakdowns, self.config
+            )
+
+        return ScoringResult(
+            all_chunks=chunks,                       # 按时间升序（原始顺序）
+            all_breakdowns=breakdowns,               # 与 all_chunks 一一对应
+            filtered_chunks=filtered_chunks,         # 按分数降序
+            filtered_breakdowns=filtered_breakdowns, # 与 filtered_chunks 一一对应
+            mode=mode,
+        )
 
     def _compute_final_score(self, bd: ScoreBreakdown) -> float:
         """MVP: FinalScore = KeyPersonBaseScore + LLMScore × 10"""
         return bd.key_person_base_score + bd.llm_score_weighted
 
-    async def _batch_llm_scoring(self, segments: list[Segment]) -> list[int]:
+    async def _batch_llm_scoring(self, chunks: list[Chunk]) -> list[int]:
         """分批调用 LLM 获取所有片段的语义评分。"""
         all_scores: list[int] = []
-        batches = batch_segments(segments, self.config.llm_batch_size)
+        batches = batch_segments(chunks, self.config.llm_batch_size)
         for batch in batches:
             scores = await call_llm_for_scores(batch, self.llm_client, self.config)
             all_scores.extend(scores)
@@ -709,7 +866,7 @@ class FullImportanceEvaluator(MVPImportanceEvaluator):
     def __init__(
         self,
         config: ScoringConfig,
-        llm_client: LLMClient,
+        llm_client: ModelClient,
         time_period_config: list[dict] | None = None,
     ):
         super().__init__(config, llm_client)
@@ -742,7 +899,7 @@ class FullImportanceEvaluator(MVPImportanceEvaluator):
         saturation = self.config.duration_saturation_minutes  # 30
         return 100.0 * math.log(1 + duration_min) / math.log(1 + saturation)
 
-    def _compute_context_score(self, segment: Segment) -> float:
+    def _compute_context_score(self, chunk: Chunk) -> float:
         """ContextScore: 结构特征评分（预留接口）。
 
         可参考特征：对话轮次数、发言人数量、发言比例均衡度等。
@@ -787,17 +944,17 @@ class FullImportanceEvaluator(MVPImportanceEvaluator):
 classDiagram
     class MVPImportanceEvaluator {
         #config: ScoringConfig
-        #llm_client: LLMClient
-        +evaluate(segments, key_people_config)
+        #llm_client: ModelClient
+        +evaluate(chunks, key_people_config, mode) ScoringResult
         #_compute_final_score(bd) float
-        #_batch_llm_scoring(segments) list~int~
+        #_batch_llm_scoring(chunks) list~int~
     }
 
     class FullImportanceEvaluator {
         -time_period_config: list
         #_compute_final_score(bd) float
         -_compute_duration_score(duration_seconds) float
-        -_compute_context_score(segment) float
+        -_compute_context_score(chunk) float
         -_compute_time_period_coeff(timestamp) float
     }
 
@@ -819,7 +976,7 @@ flowchart TD
     F --> G["Step 6: 加权合成 FinalScore<br/>w1×KP + w2×LLM×10 + w3×Dur + w4×Ctx + w5×TP"]
     G --> H["Step 7: 连续性保护<br/>(同 MVP)"]
     H --> I["Step 8: 阈值 + Top-K<br/>(同 MVP)"]
-    I --> J[输出: 排序片段列表 + ScoreBreakdown]
+    I --> J["输出: ScoringResult<br/>(含全量+筛选, 双视图)"]
 ```
 
 ---
@@ -831,12 +988,15 @@ flowchart TD
 | `ScoringPhase` | `models/scoring.py` | 评分阶段枚举 |
 | `ScoringConfig` | `models/scoring.py` | 评分参数配置 |
 | `ScoreBreakdown` | `models/scoring.py` | 评分分解记录 |
-| `compute_key_person_base_score()` | `core/importance_evaluator.py` | 计算关键人基础分 |
+| `ScoringResult` | `models/scoring.py` | 评分模块统一输出容器（含全量+筛选两组数据） <!-- FIXED: BLOCK-3 --> |
+| `compute_key_person_base_score()` | `core/importance_evaluator.py` | 计算关键人基础分（输入 `Chunk`） |
 | `batch_segments()` | `core/importance_evaluator.py` | 片段分批 |
 | `build_scoring_prompt()` | `core/importance_evaluator.py` | 构造 LLM 评分 Prompt |
-| `call_llm_for_scores()` | `core/importance_evaluator.py` | 单批次 LLM 调用 |
+| `call_llm_for_scores()` | `core/importance_evaluator.py` | 单批次 LLM 调用（通过 `ModelClient` 协议） |
 | `parse_llm_scores()` | `core/importance_evaluator.py` | 解析 LLM 响应 |
 | `apply_continuity_protection()` | `core/importance_evaluator.py` | 连续性保护 |
 | `filter_and_rank()` | `core/importance_evaluator.py` | 阈值 + Top-K 筛选 |
-| `MVPImportanceEvaluator` | `core/importance_evaluator.py` | MVP 评分器主类 |
+| `MVPImportanceEvaluator` | `core/importance_evaluator.py` | MVP 评分器主类（`evaluate()` 返回 `ScoringResult`，支持 `mode` 参数） |
 | `FullImportanceEvaluator` | `core/importance_evaluator.py` | 完整阶段评分器（预留） |
+| `match_speaker_to_key_person()` | `core/key_person_matcher.py` | 说话人→关键人匹配（由配置模块 KeyPersonMatcher 提供） |
+| `ModelClient` (协议) | `core/model_client.py` | LLM 客户端协议（原文档中的 LLMClient） |
